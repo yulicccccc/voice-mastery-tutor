@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local secrets / environment
+.env
+.env.*
+*.secret
+*.key
+
+# Local tunnel/runtime artifacts
+*.log
+*.pid
+*.url
+.tunnel-client/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
