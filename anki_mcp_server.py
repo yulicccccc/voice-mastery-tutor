@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 ANKICONNECT_URL = os.environ.get("ANKICONNECT_URL", "http://127.0.0.1:8765")
 DEFAULT_DECK = os.environ.get("ANKI_DEFAULT_DECK", "000-WuCai Inbox")
@@ -104,7 +105,14 @@ def _teacher_card(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Read due Anki cards",
+        readOnlyHint=True,
+        destructiveHint=False,
+        openWorldHint=False,
+    )
+)
 def get_due_cards(deck: str = DEFAULT_DECK, limit: int = 20) -> dict[str, Any]:
     """Get teacher-facing Anki material that is due in a deck.
 
