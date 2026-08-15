@@ -1,8 +1,8 @@
 # AI Voice Oral Mastery Coach — Living PRD
 
-**Version:** v0.8  
+**Version:** v1.2  
 **Status:** Discovery / Product Core Validation  
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-14
 
 > Synced from the project Living PRD in Google Drive. The Google Doc remains the project source of truth.
 
@@ -467,3 +467,135 @@ The system should minimize learner maintenance work. If a source card is badly p
 Product success criterion for this operating model: a user can spend most of their effort on only two actions — capture what they want to learn, and speak with the Tutor — while the system handles pedagogical transformation, progress tracking, spaced-review state, and learning-record maintenance in the background.
 
 Experiment implication: future prototype tests should evaluate not only whether the Tutor can ask and correct, but whether it can use prior learner history and conversation-derived insights to choose a materially better next question than raw Anki order alone.
+
+## 28. GOOGLE SHEET TEACHER FEED — HISTORICAL PROTOTYPE OPTION, SUPERSEDED AS PRIMARY BRIDGE
+
+Google Sheets was considered as a Teacher Feed / integration bus between capture tools, the Tutor, and a later Anki Bridge because the existing web-note workflow already supports it.
+
+Historical prototype flow:
+
+Web notes / WuCai -> Google Sheet Teacher Feed -> ChatGPT Tutor -> Tutor learning events / learner-state updates -> Google Sheet -> later Anki Bridge -> Anki/FSRS.
+
+Boundary: Google Sheets is an integration surface, not the source of truth for Anki scheduling. Anki/FSRS remains the scheduling source of truth once a card is linked. The Tutor remains the source of truth for teaching-state evidence and learner-model interpretation.
+
+**Superseded decision — 2026-08-13:** Google Sheets may remain useful as a capture source, but it is no longer the preferred bridge between the AI Tutor and Anki. Direct local Anki integration through AnkiConnect + MCP was successfully validated. Avoid unnecessary Google Drive/Sheet round-tripping between Tutor and Anki.
+
+## 29. DIRECT LOCAL ANKI ACCESS — EXPERIMENT RESULT, VALIDATED 2026-08-13
+
+Validation objective: prove that an OpenAI agent can read real due-card data from the learner’s desktop Anki without manual copy/paste.
+
+Result: VALIDATED first through Codex CLI and then through an ordinary non-Codex ChatGPT conversation using a custom MCP app over OpenAI Secure MCP Tunnel. ChatGPT itself successfully invoked `get_due_cards` and returned real local Anki data from `000-WuCai Inbox` (`total_due=8`, `returned=5`).
+
+Validated ordinary-ChatGPT path:
+
+ChatGPT conversation -> custom app `Anki Voice Tutor` -> OpenAI Secure MCP Tunnel -> local `tunnel-client` -> stdio `anki_mcp_server.py` -> AnkiConnect at `http://127.0.0.1:8765` -> desktop Anki -> real card data returned to ChatGPT.
+
+Codex direct MCP remains a useful diagnostic path but is not the intended learner-facing surface.
+
+Updated boundary: ordinary ChatGPT text-chat attachment is VALIDATED. The remaining product-surface question is whether ChatGPT voice mode can invoke the same custom MCP app reliably during a hands-free tutoring session. Voice-mode MCP use remains NOT YET VALIDATED.
+
+## 30. REPRODUCIBLE SETUP RUNBOOK — NEW COMPUTER / RECOVERY
+
+Purpose: recreate the validated read-only integration on another Windows computer without relying on conversational memory.
+
+Default recovery sequence:
+
+1. Install desktop Anki.
+2. Install and enable AnkiConnect.
+3. Keep Anki open while testing/tutoring.
+4. Install Python and clone `yulicccccc/voice-mastery-tutor` into a normal user-writable directory.
+5. Install `requirements.txt` and run `smoke_test_anki.py`.
+6. Verify `http://127.0.0.1:8765` responds and deck-scoped `is:due` returns real cards.
+7. Create/reuse OpenAI Secure MCP Tunnel and install the official `tunnel-client`.
+8. Use a restricted runtime credential; never store secrets in chat, screenshots, source control, or permanent shell history.
+9. Create an `anki-local` stdio tunnel profile pointing to `anki_mcp_server.py`; use forward slashes in the Windows script path.
+10. Run `tunnel-client doctor --profile anki-local --explain` and require `RESULT ok`.
+11. Run the tunnel in the foreground and verify `/readyz` returns `ready`.
+12. Configure/refresh the `Anki Voice Tutor` custom ChatGPT app against the tunnel and scan its tools.
+13. Require an actual ordinary ChatGPT `get_due_cards` call against real local Anki data.
+14. Only after the text path is proven, test ChatGPT voice-mode invocation.
+
+Important implementation observations:
+
+- A broad `is:due` query returned 1909 cards; tests must be deck-scoped.
+- In the validated deck, Anki UI showed 4 Learn + 4 Due while `is:due` returned 8. Tutor selection must distinguish learning/relearning from ordinary review-due cards.
+- Prefer raw `fields` from `cardsInfo`; rendered `question`/`answer` may contain large HTML/CSS noise.
+- Do not assume `Front = question` and `Back = answer`; heterogeneous note types exist.
+- Preserve both `card_id` (scheduling identity) and `note_id` (content identity).
+- Do not clone under `C:\Windows\System32`; the first attempt failed with permission denied.
+- Windows Documents may be redirected to OneDrive; do not assume paths.
+- Opening a new PowerShell may be required after installing CLI tools so PATH refreshes.
+- Read success does not validate write-back safety.
+
+## 31. TECHNICAL VALIDATION DECISION LOG — 2026-08-13
+
+**VALIDATED:**
+
+- AnkiConnect local read access.
+- Deck-scoped due discovery.
+- `cardsInfo` source-field retrieval.
+- Read-only `get_due_cards` MCP tool.
+- Codex CLI calling the MCP tool and receiving real Anki data.
+- Secure MCP Tunnel local daemon/profile reaching ready state.
+- Ordinary ChatGPT conversation -> custom app -> Secure MCP Tunnel -> Anki read path.
+
+**BLOCKED / UNVALIDATED:**
+
+- ChatGPT voice-mode invocation of the custom Anki MCP app.
+- Any Anki review write-back or content write-back through MCP.
+- Automatic persistent/background tunnel startup on a personal computer; manual foreground startup is the validated baseline.
+
+**NEXT DEFAULT TECHNICAL EXPERIMENT:**
+
+Recreate the validated manual setup on a personal computer, then test a ChatGPT voice conversation invoking the tunnel-backed `get_due_cards` tool. Keep all Anki review/content write-back disabled until read-only voice teaching quality is proven.
+
+## 32. CHATGPT APP VALIDATION, TOOL SAFETY METADATA, AND PERSONAL-PC MIGRATION — EXPERIMENT RESULT / LOCKED RECOVERY PLAN
+
+Ordinary ChatGPT acceptance result — VALIDATED 2026-08-13:
+
+A new non-Codex ChatGPT conversation successfully loaded the tunnel-backed custom app `Anki Voice Tutor`, invoked `get_due_cards`, and received the same real local Anki data as the local/Codex tests (`total_due=8`, `returned=5`; card identity matched).
+
+**Tool safety metadata pitfall:** the first ChatGPT tool scan labeled the genuinely read-only tool as WRITE / OPEN WORLD / DESTRUCTIVE because the MCP server did not declare behavioral annotations. The server must explicitly declare `readOnlyHint=true`, `destructiveHint=false`, and `openWorldHint=false`. Tool-definition changes may not appear automatically because ChatGPT can retain a frozen/snapshotted app definition; refresh/re-scan the custom app after changing annotations or schemas.
+
+**UI/product-surface pitfall:** Apps / Plugins / Connectors naming changed during the experiment. Recovery documentation should describe the underlying requirement — create/configure a custom MCP app against the existing Secure MCP Tunnel and scan its tools — rather than rely on one screenshot or legacy label.
+
+**Corporate-machine hard stop:** the original Windows test computer was company-managed and protected by SentinelOne. SentinelOne repeatedly flagged `tunnel-client.exe`; later the company security team contacted the user. Development on that managed machine must stop. Do not bypass, disable, evade, or locally whitelist corporate endpoint security. Continue only on a personal/approved test computer or with explicit IT approval.
+
+**Automatic-start status:** manual foreground tunnel startup is the validated baseline. Automatic startup was not reliably validated and must not be reproduced first on a new computer.
+
+Recovery source of truth: `docs/ANKI_MCP_CONNECTION_RUNBOOK.md` in this repository records the new-computer reproduction sequence, acceptance checks, path problems, secret-rotation lesson, ChatGPT custom-app/Tunnel validation, tool safety annotations, and corporate-security boundary. No API secret is stored in GitHub or the PRD.
+
+## 33. ADAPTIVE LEARNING DEPTH — LIGHTWEIGHT BY DEFAULT, DEEPEN ON DEMAND — LOCKED
+
+The Tutor must not force every knowledge item through a deep understanding/transfer workflow. Doing so would make sessions too slow, increase activation friction, and create an “infinite study” problem where learning becomes harder to start than the underlying material warrants.
+
+**Default policy: lightweight first.**
+
+For ordinary review, the Tutor should ask an atomic question, assess the answer, give the smallest useful correction or confirmation, record the evidence, and move on. Deep explanation, application, case-building, transfer, or counterfactual work is optional rather than a universal mastery gate.
+
+**Depth escalation should be triggered when one or more of the following is true:**
+
+- the learner explicitly says “I don’t understand,” “I can repeat it but I can’t use it,” or asks for more practice;
+- the learner repeatedly fails or shows a misconception;
+- a missing prerequisite blocks understanding;
+- the item is unusually important/high-value for the learner’s real goals;
+- the Tutor has strong evidence that shallow recall is insufficient for the target performance.
+
+When deeper learning is appropriate, the Tutor should recommend a small number of context-appropriate learning methods rather than force one fixed sequence. Candidate methods include:
+
+- concrete example;
+- analogy;
+- learner-generated explanation;
+- real personal/work case;
+- case-study framing (context → decision → action → outcome/impact);
+- counterfactual thinking;
+- comparison/counterexample;
+- near-transfer or application test.
+
+The Tutor should choose the least costly method likely to repair the actual gap, and return to lightweight review once the gap is sufficiently repaired.
+
+**Learner-state distinction:** knowing/recalling a concept but not yet being able to apply it is a legitimate intermediate state. It should not be mislabeled as full mastery, but it also should not automatically trigger a long remediation sequence unless the learner’s goal or evidence warrants deeper work.
+
+**Value-based skipping is not fatigue.** If the learner says a card is not useful, not worth learning, or should be skipped/suspended/deprioritized, the Tutor should treat that as a content-value decision rather than infer tiredness or repeatedly ask whether the learner wants to stop the whole session.
+
+**Experiment finding — 2026-08-14:** case-study and counterfactual practice substantially improved application of a simple framework, but the learner explicitly identified that making this mandatory for every card would dramatically increase startup cost and prolong sessions. Therefore deep transfer is a targeted repair/enrichment strategy, not the default review depth.
