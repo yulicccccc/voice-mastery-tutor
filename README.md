@@ -15,17 +15,20 @@ ChatGPT
   -> desktop Anki
 ```
 
-On 2026-08-13 a normal ChatGPT conversation invoked `get_due_cards` and returned the same real local Anki data seen by the local smoke test (`total_due=8`, `returned=5`).
+On 2026-08-13 a normal ChatGPT conversation invoked `get_due_cards` and returned the same real local Anki data seen by the local smoke test (`total_due=8`, `returned=5`). On 2026-08-17, one disposable card separately validated the local Good-review path through AnkiConnect's scheduler-backed `answerCards` action, including confirmed success and duplicate-sync protection.
 
-Still unvalidated: ChatGPT **voice-mode** tool invocation and all Anki review/content write-back.
+Still unvalidated: ChatGPT **voice-mode** tool invocation, ChatGPT custom-app invocation of the write tools, Again/batch review write-back, and all Anki note/content write-back.
 
-## MCP tool
+## MCP tools
 
-The bridge exposes one deliberately read-only tool:
+The bridge exposes four narrowly scoped tools:
 
 - `get_due_cards(deck="000-WuCai Inbox", limit=20)` — returns teacher-facing note fields plus card scheduling metadata. It intentionally omits Anki's rendered `question`/`answer` HTML because source note fields are cleaner and more useful for tutoring.
+- `decide_tutor_next_step(...)` — applies the lightweight-first Tutor policy and appends learner evidence to a local JSONL event log without changing Anki.
+- `record_review_result(...)` — durably records exactly one ReviewEvent for a completed interaction. First-attempt success maps to Good; first-attempt failure maps to Again. It does not call Anki.
+- `sync_pending_reviews(dry_run=true)` — checks pending ReviewEvents and scheduler snapshots. Real scheduler calls require both `dry_run=false` and `ANKI_REVIEW_WRITEBACK_ENABLED=true`.
 
-The tool declares MCP safety hints as read-only, non-destructive, and closed-world so ChatGPT does not have to infer risk from missing metadata.
+The Anki read tool declares read-only safety hints. Tutor and ReviewEvent tools accurately declare their local writes as non-destructive and closed-world.
 
 ## Local setup
 
@@ -73,7 +76,9 @@ Do not reproduce the tunnel work on a managed corporate computer if endpoint-sec
 
 ## Safety boundary for this milestone
 
-This version is **read-only**. It does not submit Anki reviews, edit note fields, or manipulate FSRS scheduling state.
+Anki reads and `record_review_result` do not mutate Anki. Tutor decisions use a local append-only JSONL store; ReviewEvents use a local SQLite queue with stable event IDs. `sync_pending_reviews` defaults to dry-run, and real review write-back is disabled unless `ANKI_REVIEW_WRITEBACK_ENABLED=true` is explicitly set for the process.
+
+The one approved Good-path experiment used AnkiConnect's normal scheduler mechanism and did not directly edit due dates, intervals, stability, difficulty, FSRS internals, or note content. Production/batch write-back remains disabled.
 
 ## Product documentation
 

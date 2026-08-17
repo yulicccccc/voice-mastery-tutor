@@ -1,7 +1,7 @@
 # Anki ↔ ChatGPT / OpenAI Agent Connection Runbook
 
-**Validated:** 2026-08-13  
-**Scope:** read-only local Anki access  
+**Validated:** 2026-08-17
+**Scope:** local Anki read, durable Tutor state, and controlled review sync
 **Canonical product record:** Living PRD in Google Drive
 
 This document exists so the integration can be rebuilt on a different computer without relying on chat history.
@@ -16,7 +16,12 @@ This document exists so the integration can be rebuilt on a different computer w
 | Secure MCP Tunnel → local MCP readiness | **VALIDATED** | `doctor` passed; `/readyz` returned `ready` |
 | Ordinary ChatGPT conversation → custom Anki app → Secure MCP Tunnel → local MCP → Anki | **VALIDATED on 2026-08-13** | a new non-Codex ChatGPT conversation called the Anki tool and returned the same real due-card data (`total_due=8`, `returned=5`) |
 | ChatGPT voice mode → Anki tool | **NOT YET VALIDATED** | next product-surface test |
-| Anki review/write-back | **NOT YET VALIDATED** | keep disabled until separate safety experiment |
+| Local Tutor policy → JSONL learner state | **UNIT TESTED 2026-08-17** | lightweight/deep decisions, restart recovery, learner override, value skip, and continuity |
+| Durable ReviewEvent queue | **UNIT TESTED 2026-08-17** | stable IDs, restart recovery, duplicate-sync protection, conflict handling, and zero-write dry-run |
+| One disposable card → Good → Anki scheduler | **VALIDATED 2026-08-17** | `answerCards` returned `[true]`; event became applied; immediate retry found zero pending and did not increment reps again |
+| Again, batch, or production review/write-back | **NOT YET VALIDATED / DISABLED** | requires separate approval; default feature flag remains false |
+| ChatGPT custom-app/voice invocation of write tools | **NOT YET VALIDATED** | local scheduler feasibility does not prove product-surface invocation |
+| Anki note/content write-back | **DISABLED / OUT OF SCOPE** | no note fields or FSRS internals are edited |
 | Automatic Windows background startup | **NOT VALIDATED** | a managed corporate PC triggered endpoint-security intervention; do not reproduce there |
 
 The important product result is now stronger than the original Codex-only test:
@@ -45,6 +50,10 @@ anki_mcp_server.py
 Support files:
 
 ```text
+models.py
+learner_store.py
+tutor_engine.py
+review_sync.py
 requirements.txt
 smoke_test_anki.py
 README.md
@@ -57,14 +66,33 @@ Current MCP server behavior:
 - stdio MCP transport.
 - Default AnkiConnect endpoint: `http://127.0.0.1:8765`.
 - Default deck: `000-WuCai Inbox`.
-- Tool: `get_due_cards(deck, limit)`.
+- Tools: `get_due_cards`, `decide_tutor_next_step`, `record_review_result`, and
+  `sync_pending_reviews`.
 - Calls AnkiConnect `findCards`, then `cardsInfo`.
 - Returns `card_id`, `note_id`, model, raw note fields, and scheduling metadata useful to a teacher.
 - Omits rendered Anki `question` / `answer` HTML/CSS noise.
-- Read-only: it does not answer cards, edit notes, or mutate FSRS state.
-- Declares MCP safety hints: read-only, non-destructive, closed-world.
+- `get_due_cards` remains read-only and never answers cards, edits notes, or
+  mutates FSRS state.
+- `decide_tutor_next_step` records local Tutor evidence and never calls
+  AnkiConnect.
+- `record_review_result` creates one durable ReviewEvent per card/scheduler
+  snapshot and does not call AnkiConnect. `not_attempted` creates no fake review.
+- `sync_pending_reviews` defaults to dry-run and requires the process-level
+  `ANKI_REVIEW_WRITEBACK_ENABLED=true` flag for a real scheduler call.
+- Before applying, review sync compares the current scheduler snapshot with the
+  durable event snapshot. External changes become conflicts; only confirmed
+  AnkiConnect success marks an event applied.
+- No code directly updates the Anki database, note fields, due/interval values,
+  stability, difficulty, or other FSRS internals.
 
-Why the safety hints matter: during the first ChatGPT app scan, the tool was incorrectly shown as WRITE / OPEN WORLD / DESTRUCTIVE because the server did not declare annotations. That was a metadata problem, not actual behavior. The server now explicitly declares the tool as read-only.
+Installed API investigation on 2026-08-17 found Anki 25.09 with AnkiConnect API
+v6. The installed `answerCards` action delegates to Anki's
+`scheduler.answerCard(card, ease)`. Good maps to ease 3 and Again to ease 1.
+AnkiConnect does not accept an idempotency key or atomically combine the snapshot
+precheck with the answer, so a small race window remains. Do not work around that
+limitation by editing Anki's database.
+
+Why the safety hints matter: during the first ChatGPT app scan, the read tool was incorrectly shown as WRITE / OPEN WORLD / DESTRUCTIVE because the server did not declare annotations. That was a metadata problem, not actual behavior. The read tool now explicitly declares read-only behavior; local Tutor/queue writes are declared non-read-only but non-destructive and closed-world.
 
 Important ChatGPT behavior: custom app tool definitions may be snapshotted/frozen. After changing MCP annotations or schemas, refresh/re-scan the app tools in ChatGPT rather than assuming the UI updates automatically.
 
@@ -431,18 +459,39 @@ Do not claim the voice product loop is solved until a real voice session trigger
 
 ### 11.2 Review/write-back
 
-Read access does **not** prove safe scheduling write-back.
+Read access did not by itself prove safe scheduling write-back. A separate,
+approved experiment on 2026-08-17 validated only the Good path on one disposable
+card in a dedicated test deck:
 
-Still separate experiments:
+```text
+completed card
+  -> durable pending ReviewEvent
+  -> sync_pending_reviews(dry_run=false)
+  -> AnkiConnect answerCards(ease=3)
+  -> Anki scheduler
+  -> confirmed [true]
+  -> ReviewEvent applied
+```
 
-- submit first-attempt Again/Good through Anki scheduler;
-- preserve revlog / FSRS semantics;
-- idempotency;
-- offline queue;
-- conflict detection;
-- note/Tutor Overlay updates.
+Observed scheduler behavior was consistent with a new-card Good review: the card
+moved from new to learning, `reps` changed from 0 to 1, and Anki updated its own
+scheduler fields. Repeating sync immediately returned `pending_found=0`, made no
+second `answerCards` call, and left `reps` at 1.
 
-Keep the current MCP read-only until those are deliberately tested.
+The feature flag was enabled only for the experiment process and was disabled
+again immediately afterward. Its repository default remains false.
+
+Still separate experiments requiring explicit approval:
+
+- one disposable Again review;
+- batch or production review write-back;
+- concurrent multi-client behavior and AnkiWeb sync;
+- ordinary ChatGPT custom-app write invocation;
+- ChatGPT voice-mode write invocation;
+- note/Tutor Overlay content updates.
+
+Keep production write-back disabled. The validated experiment does not authorize
+real learning-card writes, batch synchronization, or note/content mutation.
 
 ### 11.3 Automatic startup
 
