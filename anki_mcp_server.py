@@ -1,27 +1,44 @@
-"""Read-only MCP bridge from ChatGPT to local Anki via AnkiConnect.
-
-MVP scope: expose one teacher-facing tool, get_due_cards().
-The server uses stdio by default so OpenAI Secure MCP Tunnel can launch it locally.
-"""
+"""Anki read bridge, local Tutor policy, and guarded ReviewEvent sync tools."""
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from learner_store import JsonlLearnerStore, SqliteReviewStore
+from models import (
+    AnswerAssessment,
+    FirstAttemptResult,
+    LearnerState,
+    QuestionType,
+    ReviewSyncStatus,
+    SchedulerSnapshot,
+    TutorContext,
+)
+from review_sync import (
+    AnkiConnectReviewAdapter,
+    ReviewSyncService,
+    build_review_event,
+)
+from tutor_engine import TutorEngine
+
 ANKICONNECT_URL = os.environ.get("ANKICONNECT_URL", "http://127.0.0.1:8765")
 DEFAULT_DECK = os.environ.get("ANKI_DEFAULT_DECK", "000-WuCai Inbox")
 ANKICONNECT_VERSION = 6
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("ANKICONNECT_TIMEOUT", "8"))
 MAX_CARDS_PER_CALL = 100
+ANKI_REVIEW_WRITEBACK_ENABLED = os.environ.get(
+    "ANKI_REVIEW_WRITEBACK_ENABLED", "false"
+).lower() in {"1", "true", "yes"}
 
 mcp = FastMCP("voice-mastery-tutor")
+_tutor_engine = TutorEngine(JsonlLearnerStore())
 
 
 def _anki_call(action: str, params: dict[str, Any] | None = None) -> Any:
@@ -61,6 +78,14 @@ def _anki_call(action: str, params: dict[str, Any] | None = None) -> Any:
         raise RuntimeError(f"AnkiConnect error: {decoded['error']}")
 
     return decoded["result"]
+
+
+_review_store = SqliteReviewStore()
+_review_sync_service = ReviewSyncService(
+    _review_store,
+    AnkiConnectReviewAdapter(_anki_call),
+    writeback_enabled=ANKI_REVIEW_WRITEBACK_ENABLED,
+)
 
 
 def _deck_due_query(deck: str) -> str:
@@ -147,6 +172,151 @@ def get_due_cards(deck: str = DEFAULT_DECK, limit: int = 20) -> dict[str, Any]:
         "returned": len(cards),
         "cards": cards,
     }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Choose the Tutor's next teaching step",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+def decide_tutor_next_step(
+    card_id: int,
+    learner_answer: str,
+    assessment: Literal["correct", "incorrect", "partial", "unknown"],
+    note_id: int | None = None,
+    was_prompted: bool = False,
+    consecutive_incorrect: int = 0,
+    question_type: Literal[
+        "fact", "concept", "abstract", "process", "application", "decision", "causal"
+    ] = "concept",
+    has_personal_context: bool = False,
+    stable_mastery_evidence: bool = False,
+    learner_rejects_mastery: bool = False,
+) -> dict[str, Any]:
+    """Apply the lightweight-first Tutor policy to one learner answer.
+
+    ChatGPT should compare the answer with the card material and pass its semantic
+    judgment in `assessment`. The policy handles explicit learner intent, state
+    transitions, depth escalation, one-method teaching selection, and session
+    continuity. It appends one local JSONL Tutor event, but never writes to Anki or
+    changes FSRS, due dates, intervals, notes, or review history. Set
+    `learner_rejects_mastery` when the learner corrects a prior mastery judgment;
+    the learner's correction wins over Tutor-inferred mastery evidence. A true
+    `mastered` state also requires previously persisted independent-recall
+    evidence; one answer can only become a mastery candidate.
+    """
+    context = TutorContext(
+        card_id=card_id,
+        note_id=note_id,
+        learner_answer=learner_answer,
+        assessment=AnswerAssessment(assessment),
+        was_prompted=was_prompted,
+        consecutive_incorrect=consecutive_incorrect,
+        question_type=QuestionType(question_type),
+        has_personal_context=has_personal_context,
+        stable_mastery_evidence=stable_mastery_evidence,
+        learner_rejects_mastery=learner_rejects_mastery,
+    )
+    decision = _tutor_engine.decide(context)
+    return {
+        "card_id": card_id,
+        "note_id": note_id,
+        "event_saved_locally": True,
+        "anki_mutated": False,
+        **decision.to_dict(),
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Record one completed card ReviewEvent",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def record_review_result(
+    card_id: int,
+    first_attempt_result: Literal["succeeded", "failed", "not_attempted"],
+    tutor_state: Literal[
+        "retrieval_gap",
+        "independent_recall",
+        "prompted_recall",
+        "understanding_gap",
+        "known_but_not_transferable",
+        "mastered",
+        "skipped_low_value",
+        "paused",
+    ],
+    scheduler_snapshot: dict[str, Any],
+    note_id: int | None = None,
+    hints_used: int = 0,
+) -> dict[str, Any]:
+    """Durably record the scheduling outcome of one completed card interaction.
+
+    The Anki rating is fixed by the first unaided attempt: succeeded maps to Good,
+    failed maps to Again, and later hints/retries do not change it. A
+    `not_attempted` value creates no ReviewEvent. The stable event ID is derived
+    from the card and scheduler snapshot, so an identical repeated completion is
+    idempotent. This tool never calls AnkiConnect or modifies Anki.
+    """
+    snapshot = SchedulerSnapshot.from_mapping(scheduler_snapshot)
+    event = build_review_event(
+        card_id=card_id,
+        note_id=note_id,
+        first_attempt_result=FirstAttemptResult(first_attempt_result),
+        tutor_state=LearnerState(tutor_state),
+        hints_used=hints_used,
+        scheduler_snapshot=snapshot,
+    )
+    if event is None:
+        return {
+            "recorded": False,
+            "duplicate": False,
+            "event_id": None,
+            "sync_status": ReviewSyncStatus.NOT_APPLICABLE.value,
+            "reason": "no genuine first unaided retrieval attempt",
+            "anki_mutated": False,
+        }
+
+    stored, created = _review_store.create_or_get(event)
+    return {
+        "recorded": True,
+        "duplicate": not created,
+        "anki_mutated": False,
+        **stored.to_dict(),
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Safely synchronize pending Anki ReviewEvents",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def sync_pending_reviews(
+    dry_run: bool = True,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Inspect or synchronize durable pending ReviewEvents one card at a time.
+
+    `dry_run` defaults to true. Real scheduler writes also require the process-level
+    `ANKI_REVIEW_WRITEBACK_ENABLED=true` feature flag. Before any enabled write,
+    the current Anki card snapshot must exactly match the event snapshot. The
+    adapter uses AnkiConnect's scheduler-backed `answerCards` action; it never
+    edits Anki DB rows or FSRS fields directly. Only a confirmed `[true]` response
+    marks an event applied.
+    """
+    return _review_sync_service.sync_pending(dry_run=dry_run, limit=limit)
+
 
 
 if __name__ == "__main__":
