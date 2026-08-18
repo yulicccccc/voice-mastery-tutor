@@ -103,10 +103,18 @@ class JsonlLearnerStore:
 
     def latest_for_card(self, card_id: int) -> dict[str, Any] | None:
         latest = None
-        for event in self.read_all():
-            if event.get("card_id") == card_id:
-                latest = event
+        for event in self.read_card_events(card_id):
+            latest = event
         return latest
+
+    def read_card_events(self, card_id: int) -> list[dict[str, Any]]:
+        if card_id < 1:
+            raise ValueError("card_id must be a positive integer")
+        return [
+            event
+            for event in self.read_all()
+            if event.get("card_id") == card_id
+        ]
 
     def has_state_for_card(self, card_id: int, states: set[str]) -> bool:
         return any(

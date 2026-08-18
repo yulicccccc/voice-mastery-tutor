@@ -176,6 +176,24 @@ def get_due_cards(deck: str = DEFAULT_DECK, limit: int = 20) -> dict[str, Any]:
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Read compact durable Tutor context for one card",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def get_tutor_context(card_id: int) -> dict[str, Any]:
+    """Resume teaching context for one card without ChatGPT history or Anki.
+
+    The result is reconstructed only from local durable Tutor events, includes at
+    most five recent events for this card, and never reads or mutates Anki.
+    """
+    return _tutor_engine.build_tutor_context(card_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Choose the Tutor's next teaching step",
         readOnlyHint=False,
         destructiveHint=False,

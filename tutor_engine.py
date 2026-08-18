@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from uuid import uuid4
 
 from learner_store import JsonlLearnerStore
@@ -109,6 +110,18 @@ MASTERY_CORRECTION_PHRASES = (
     "不要标记为掌握",
 )
 
+RECENT_TUTOR_CONTEXT_LIMIT = 5
+RESUME_TARGET_BY_STATE = {
+    LearnerState.RETRIEVAL_GAP: "independent_retrieval",
+    LearnerState.PROMPTED_RECALL: "independent_retrieval",
+    LearnerState.UNDERSTANDING_GAP: "understanding_repair",
+    LearnerState.KNOWN_BUT_NOT_TRANSFERABLE: "application_transfer",
+    LearnerState.INDEPENDENT_RECALL: "normal_spaced_retrieval",
+    LearnerState.MASTERED: "normal_spaced_retrieval",
+    LearnerState.SKIPPED_LOW_VALUE: "deprioritized_or_skip",
+    LearnerState.PAUSED: "resume_when_ready",
+}
+
 
 class TutorEngine:
     def __init__(self, store: JsonlLearnerStore | None = None) -> None:
@@ -193,6 +206,99 @@ class TutorEngine:
             return LearnerState(event["state"])
         except (KeyError, ValueError):
             return None
+
+    def build_tutor_context(self, card_id: int) -> dict[str, Any]:
+        """Reconstruct compact teaching context from durable events for one card."""
+        if card_id < 1:
+            raise ValueError("card_id must be a positive integer")
+
+        stored_events = (
+            self.store.read_card_events(card_id) if self.store is not None else []
+        )
+        relevant_events: list[tuple[dict[str, Any], LearnerState]] = []
+        for event in stored_events:
+            try:
+                state = LearnerState(event["state"])
+            except (KeyError, ValueError):
+                continue
+            relevant_events.append((event, state))
+
+        independent_results: list[str] = []
+        prompted_success_seen = False
+        hints_used = False
+        states: list[LearnerState] = []
+
+        for event, state in relevant_events:
+            states.append(state)
+            assessment = event.get("assessment")
+            was_prompted = event.get("was_prompted") is True
+            if was_prompted and assessment == AnswerAssessment.CORRECT.value:
+                prompted_success_seen = True
+            elif not was_prompted and state not in {
+                LearnerState.SKIPPED_LOW_VALUE,
+                LearnerState.PAUSED,
+            }:
+                if assessment == AnswerAssessment.CORRECT.value:
+                    independent_results.append("succeeded")
+                elif assessment in {
+                    AnswerAssessment.INCORRECT.value,
+                    AnswerAssessment.PARTIAL.value,
+                } or (
+                    assessment == AnswerAssessment.UNKNOWN.value
+                    and state == LearnerState.RETRIEVAL_GAP
+                ):
+                    independent_results.append("failed")
+            if was_prompted or event.get("action") == TutorAction.GIVE_HINT.value:
+                hints_used = True
+
+        latest_state = states[-1] if states else None
+        recent_events = [
+            self._compact_context_event(event)
+            for event, _ in relevant_events[-RECENT_TUTOR_CONTEXT_LIMIT:]
+        ]
+
+        return {
+            "card_id": card_id,
+            "has_history": bool(relevant_events),
+            "latest_state": latest_state.value if latest_state else None,
+            "retrieval": {
+                "independent_attempt_seen": bool(independent_results),
+                "independent_failure_seen": "failed" in independent_results,
+                "latest_independent_result": (
+                    independent_results[-1] if independent_results else None
+                ),
+                "prompted_success_seen": prompted_success_seen,
+            },
+            "teaching_evidence": {
+                "hints_used": hints_used,
+                "understanding_gap_seen": (
+                    LearnerState.UNDERSTANDING_GAP in states
+                ),
+                "application_gap_seen": (
+                    LearnerState.KNOWN_BUT_NOT_TRANSFERABLE in states
+                ),
+            },
+            "recommended_resume_target": (
+                RESUME_TARGET_BY_STATE[latest_state]
+                if latest_state
+                else "first_retrieval"
+            ),
+            "recent_relevant_events": recent_events,
+        }
+
+    @staticmethod
+    def _compact_context_event(event: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "event_id": event.get("event_id"),
+            "created_at": event.get("created_at"),
+            "card_id": event.get("card_id"),
+            "state": event.get("state"),
+            "assessment": event.get("assessment"),
+            "was_prompted": event.get("was_prompted") is True,
+            "action": event.get("action"),
+            "teaching_method": event.get("teaching_method"),
+            "mastered_candidate": event.get("mastered_candidate") is True,
+        }
 
     def _correct_decision(self, context: TutorContext) -> TutorDecision:
         if context.was_prompted:
