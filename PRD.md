@@ -1,10 +1,10 @@
 # AI Voice Oral Mastery Coach — Living PRD
 
-**Version:** v1.5
+**Version:** v1.8
 
 **Status:** Discovery / Product Core Validation
 
-**Last updated:** 2026-08-17
+**Last updated:** 2026-08-23
 
 ## 0. DOCUMENT RULES — LOCKED
 
@@ -30,7 +30,32 @@ Internal shorthand: “advanced voice Anki + human-like tutor.” This is useful
 
 ## 3. CORE LEARNING MODEL — LOCKED
 
-The product uses two nested loops.
+The product operates across a complete 5-stage learning lifecycle.
+
+Canonical learning lifecycle:
+
+```text
+Capture
+↓
+Teacher Triage / Knowledge Routing
+↓
+Learn
+↓
+Consolidate / Schedule
+↓
+Revisit / Evolve
+```
+
+Core product principle:
+
+```text
+Capture cheaply
+→ Teacher decides what deserves learning
+→ Tutor decides how to learn it
+→ Anki decides when to revisit it
+```
+
+Within the active teaching and retention stages, the product uses two nested loops.
 
 Inner Tutor Loop:
 
@@ -40,7 +65,7 @@ Outer Memory Loop:
 
 Due item → retrieval attempt → review outcome → spaced scheduling → future retest.
 
-Anki/FSRS is the preferred memory scheduler in early versions. The AI Tutor owns diagnosis and teaching.
+Anki/FSRS is the preferred memory scheduler in early versions. The AI Tutor owns triage, diagnosis, and teaching.
 
 ## 4. DEFAULT LEARNING UNIT — LOCKED
 
@@ -1277,3 +1302,454 @@ Use one new disposable test card to validate the Again path: first unaided retri
 Product conclusion:
 
 The core review-write architecture has crossed an important feasibility threshold: safe local event persistence, one real scheduler-mediated Good review, confirmed applied-state transition, and no duplicate review on immediate retry have all been demonstrated. The remaining question is no longer simply whether Anki can be written; it is whether the same safety properties hold across failure outcomes, fresh ChatGPT sessions, voice-triggered tool calls, and sustained real-world use.
+
+## 37. CONTROLLED REAL ANKI SCHEDULER WRITE-BACK — AGAIN PATH + SEMANTIC SEPARATION VALIDATED 2026-08-17 — EXPERIMENT RESULT
+
+Validation scope:
+
+A second new disposable card in deck `999-AI-Tutor-Writeback-Test` was used to validate the real local Again scheduler path. This remained a one-card controlled experiment. No real learning card was modified, Anki sync was not triggered, the locked v1.5 implementation commits were not changed, and the write-back feature flag was disabled again immediately after testing.
+
+Validated learner/tutor path:
+
+First unaided retrieval failed -> Tutor classified retrieval gap -> Tutor gave one hint -> learner answered correctly after help -> Tutor state became `prompted_recall` -> durable Tutor storage survived engine reload and restored `prompted_recall`.
+
+Critical semantic separation — VALIDATED:
+
+The learner’s eventual success after tutoring did not rewrite the Anki scheduling result. Because the first unaided retrieval failed, the ReviewEvent remained mapped to `Again` even though the post-teaching Tutor state improved to `prompted_recall`.
+
+Canonical meaning now demonstrated in a real scheduler write:
+
+- Anki review state answers: how did the first independent retrieval attempt perform? Result: failed -> Again.
+
+- Tutor learner state answers: what can the learner do after teaching in this interaction? Result: prompted recall after one hint.
+
+- These two states are intentionally different and persisted independently.
+
+Test ReviewEvent:
+
+- event_id: `review_92e768a5bf377002173aee0ab9d3d31f`;
+
+- card_id: `1786986641375`;
+
+- note_id: `1786986641330`;
+
+- first_attempt_result: failed;
+
+- mapped_anki_rating: Again;
+
+- tutor_state: prompted_recall;
+
+- hints_used: 1;
+
+- initial sync_status: pending;
+
+- initial sync_attempts: 0.
+
+Actual AnkiConnect write:
+
+- action: `answerCards`;
+
+- cardId: `1786986641375`;
+
+- ease: `1` (Again);
+
+- AnkiConnect response: `[true]`.
+
+Confirmation ordering — VALIDATED:
+
+After AnkiConnect had returned `[true]` but before control returned from the adapter to the sync service, the ReviewEvent was still `pending`. Only after the sync service received confirmed success did the event transition to `applied`. Final event state: `applied`, `sync_attempts=1`, `last_error=null`.
+
+Observed scheduler change:
+
+Before review, the disposable card was new (`queue=0`, `type=0`, `reps=0`, `left=0`). After the confirmed Again review, Anki moved it into the learning queue (`queue=1`, `type=1`, `reps=1`, `left=3`) and updated scheduler-managed due/modified values. The Tutor did not directly modify due, interval, stability, difficulty, or FSRS internals.
+
+Duplicate-sync protection — VALIDATED FOR AGAIN PATH:
+
+A second immediate `sync_pending_reviews(dry_run=false)` found zero pending events. `answerCards` was not called again, scheduler state remained unchanged, and `reps` remained 1. Total real `answerCards` calls for this Again experiment: exactly 1.
+
+Feature-flag safety — RECONFIRMED:
+
+After testing, `ANKI_REVIEW_WRITEBACK_ENABLED` was absent/disabled in the shell and launchd environment, and a fresh process plus service read the effective setting as false. Real write-back therefore remained opt-in at that experiment boundary.
+
+Combined scheduler validation status as of 2026-08-17:
+
+- controlled disposable-card Good path / ease 3: VALIDATED;
+
+- controlled disposable-card Again path / ease 1: VALIDATED;
+
+- confirmed-success-only `pending -> applied` transition: VALIDATED in both paths;
+
+- immediate duplicate retry does not create a second scheduler review: VALIDATED in both paths;
+
+- Tutor state survives engine reload in the Again teaching case: VALIDATED;
+
+- first-attempt scheduling outcome remains separate from post-teaching Tutor state: VALIDATED.
+
+Validation boundary / still unvalidated:
+
+These experiments do NOT yet establish production-safe or general-purpose write-back. Still unvalidated:
+
+- batch review write-back on real learning cards;
+
+- sustained multi-card use over normal study sessions;
+
+- concurrent multi-client race behavior beyond the current snapshot/conflict protections;
+
+- AnkiWeb synchronization behavior after Tutor-generated reviews;
+
+- ordinary ChatGPT custom-app invocation of `record_review_result` / `sync_pending_reviews` as real write tools;
+
+- ChatGPT voice-mode invocation of review-write tools;
+
+- Anki note/content write-back;
+
+- full fresh-conversation recovery where old chat context is absent and pending review + Tutor learner state are restored together.
+
+Known AnkiConnect limitation remains unchanged:
+
+`answerCards` provides neither an idempotency key nor an atomic snapshot-guard-plus-answer operation. The durable queue and snapshot checks substantially reduce duplicate/conflict risk, but a narrow race window remains. Do not bypass this limitation by directly editing the Anki database or FSRS scheduling fields.
+
+Next product-critical experiment:
+
+Test the architecture across an actual session boundary rather than adding more scheduler ratings. Session A should create durable learner state and a pending ReviewEvent, then the old process/conversation should be discarded. Session B should start from a fresh ChatGPT conversation with no old transcript, restore the relevant Tutor learner state from durable storage, discover the pending ReviewEvent, safely synchronize it to Anki, and continue from the correct next teaching target.
+
+Acceptance target for the next experiment:
+
+`Session A -> durable Tutor state + pending ReviewEvent -> discard old session/process -> Session B/new conversation -> restore Tutor context -> safely sync pending review -> continue teaching`, with no dependency on the old ChatGPT transcript.
+
+Product conclusion:
+
+The MVP now has controlled real scheduler evidence for both first-attempt outcomes used by the current rating policy: independent success -> Good and independent failure -> Again. More importantly, the Again experiment proves that Anki scheduling evidence and Tutor post-teaching mastery evidence can diverge correctly without corrupting one another. The next major unknown is no longer rating semantics; it is whether this durable state survives and reconnects correctly across a genuinely fresh ChatGPT session.
+
+## 38. FREE PRIVATE GPT ACTION OPERATING PATH — QUICK TUNNEL RECOVERY + DAILY WRITE-BACK MODE — LOCKED
+
+Product decision:
+
+The ordinary user-facing classroom remains the private ChatGPT GPT “AI Anki Tutor,” including desktop text and mobile Voice Mode. Codex is an installation, recovery, and diagnostic surface only. The product does not require a paid OpenAI Business workspace or an OpenAI organization tunnel for the current personal MVP.
+
+Validated transport chain:
+
+Desktop Anki -> identity-verified local Anki access at `127.0.0.1:28765` -> private Tutor Actions API at `127.0.0.1:28766` -> free Cloudflare Quick Tunnel (`*.trycloudflare.com`) -> private GPT Action -> ordinary ChatGPT conversation / mobile Voice Mode.
+
+Persistent local services:
+
+- `com.yulicccccc.voice-mastery-tutor.actions-api` keeps the private Actions API running.
+- `com.yulicccccc.voice-mastery-tutor.gateway-tunnel` keeps `cloudflared` running.
+- The tunnel LaunchAgent must execute `scripts/run_quick_tunnel.zsh`, not the Worker-origin update script. Restarting the free tunnel must not silently deploy or mutate an unrelated Cloudflare Worker.
+- The Actions API reads Anki through `ANKICONNECT_URL=http://127.0.0.1:28765`.
+- The public tunnel forwards only to `http://127.0.0.1:28766`; it is not a general-purpose proxy to AnkiConnect.
+
+Tutor authentication rule:
+
+The GPT Action uses a project-local Bearer token. This token is NOT an OpenAI API key, cannot be used to call OpenAI models, and does not create OpenAI API usage charges. The token is stored only in macOS Keychain under service `voice-mastery-tutor-actions`. Never place the token value in the PRD, repository, logs, shell history, screenshots, or ChatGPT transcript.
+
+Important GPT editor behavior:
+
+Changing the Action server hostname or reopening Authentication can leave the hidden API Key field empty. Clicking Save while it is empty removes the saved Bearer credential. Therefore, after every hostname change, explicitly restore the Keychain-backed Tutor token, keep Auth Type = Bearer, save Authentication, and then Update the GPT.
+
+Quick Tunnel lifecycle:
+
+A free Quick Tunnel hostname is stable only for the life of the current `cloudflared` process. The LaunchAgent automatically restarts the tunnel, but a new process may receive a new random `*.trycloudflare.com` hostname. This is an expected transport-recovery event, not loss of Tutor learner memory, study-session state, or ReviewEvents.
+
+Canonical recovery procedure after a tunnel restart:
+
+1. Confirm the local Actions API is running and `GET http://127.0.0.1:28766/health` returns HTTP 200.
+2. Read the newly created `https://<random>.trycloudflare.com` hostname from the tunnel log.
+3. Confirm public `GET /health` returns HTTP 200.
+4. Confirm public `GET /openapi.json` names that exact hostname in `servers[0].url` and exposes exactly the six intended operations: `getDueCards`, `getStudySession`, `getTutorContext`, `decideTutorNextStep`, `recordReviewResult`, and `syncPendingReviews`.
+5. Before touching the GPT editor, make one authenticated read-only `POST /v1/study-session` preflight using the Keychain-backed Tutor token without printing it. The response must return the expected active durable session/card count.
+6. In the private GPT editor, replace only the Action schema server URL with the new Quick Tunnel origin.
+7. Reopen Authentication, restore the Tutor Bearer token, save Authentication, and Update the GPT.
+8. Run the editor’s `getStudySession` Test. On the first call to a new hostname, choose `Always allow`.
+9. Acceptance requires a real `POST /v1/study-session HTTP/1.1` 200 entry in the local Actions log plus the expected durable `session_id` in the GPT result.
+10. Do not test `recordReviewResult` or `syncPendingReviews` merely to prove transport. Read-only `getStudySession` is the transport acceptance gate.
+
+Diagnostic boundary:
+
+- `ClientResponseError` with no corresponding local POST means the request was blocked before reaching the Mac; investigate new-domain approval or GPT Authentication, not Anki.
+- A local/public 401 `missing_or_invalid_bearer_token` means the Tutor Bearer token is missing or invalid.
+- A 502 means the Action reached the adapter but the downstream local Tutor/Anki service was unavailable.
+- A local POST 200 with the expected durable session proves the read path is operational.
+- Port responsiveness alone is not identity proof. Before any Anki write experiment, verify that the configured local Anki endpoint exposes the intended collection/decks and is not an unrelated bridge impersonating AnkiConnect.
+
+Validated acceptance result:
+
+The recovered free Quick Tunnel passed public health and OpenAPI checks. The private GPT was updated to the new hostname, the Tutor Bearer credential was restored from Keychain, the new domain was granted `Always allow`, and a real GPT editor `getStudySession` call reached the Mac as HTTP 200 and recovered the active durable 10-card batch. No Anki scheduler write occurred during this read-path validation.
+
+Voice travel behavior:
+
+The desktop Anki add-on may select a user-chosen deck set and 1–20 cards. `getStudySession` loads the complete voice handoff packet into the ChatGPT conversation before Voice Mode. After that packet is embedded, the user may leave the Mac and continue the same conversation on the phone in Voice Mode without additional Actions for each card. The Mac, Actions API, and tunnel must be online again when the user later saves durable results or explicitly updates Anki.
+
+Daily write-back operating mode:
+
+The implementation default remains fail-closed: without explicit environment configuration, real Anki review write-back is disabled. After the Good and Again disposable-card experiments validated scheduler-mediated writes, duplicate protection, and confirmed-success-only `pending -> applied` transitions, the user explicitly approved enabling real review write-back on this personal Mac.
+
+The machine LaunchAgent may therefore set `ANKI_REVIEW_WRITEBACK_ENABLED=true` for normal daily use. Enabling the flag does not itself review any card. A real write occurs only when the user explicitly says “更新 Anki” and the GPT calls `syncPendingReviews(dry_run=false)` for the current active `session_id`.
+
+Every real sync must retain the existing safety contract:
+
+- scope synchronization to the current study session;
+- preserve first-attempt rating semantics: independent success -> Good; independent failure -> Again;
+- apply each durable ReviewEvent at most once under the current idempotency protections;
+- compare the scheduler snapshot and mark external changes conflicted rather than overwriting them;
+- mark an event applied only after confirmed AnkiConnect success;
+- leave unavailable/failed work pending or explicitly retryable;
+- never directly edit the Anki database, due, interval, stability, difficulty, or other FSRS internals;
+- never write note content through the review-sync path;
+- a low-value skip without genuine retrieval produces no fake Anki review.
+
+Runtime verification after changing write-back mode:
+
+Restart only the Actions API service, not the Quick Tunnel. Confirm both local and public `/health` return the intended `anki_writeback_enabled` value. Do not infer the effective mode from a plist/file alone.
+
+Current validation boundary:
+
+The free private GPT read path and durable study-session recovery through the current Quick Tunnel are VALIDATED. Local scheduler Good and Again write-back paths are VALIDATED on disposable cards. Daily write-back has been explicitly enabled by the user. A production claim for sustained multi-card real-learning synchronization through the GPT Action remains gated on an actual user-requested “更新 Anki” run with per-event results, conflict outcomes, duplicate protection, and final Anki scheduler confirmation recorded.
+
+## 39. COMPLETE LEARNING LIFECYCLE & ITEM PROCESSING STATES — LOCKED
+
+Core distinction: **Capture ≠ Learning ≠ Mastery.** The product no longer treats capture as learning.
+
+The capture layer is decoupled from the learning engine. Ingesting content into an inbox is cheap, but learning requires intentional pedagogical decisions.
+
+Canonical 5-stage flow:
+
+```text
+Capture (via 网页记 / browser clipping -> Anki Inbox)
+↓
+Teacher Triage / Knowledge Routing (evaluate value, intent, learner model)
+↓
+Learn (Voice Tutor interactive dialogue)
+↓
+Consolidate / Schedule (ReviewEvent, Tutor Overlay, Anki scheduler write-back)
+↓
+Revisit / Evolve (spaced retrieval, card update events, evolving learner model)
+```
+
+Capture continues to be handled cheaply by upstream tooling (e.g. 网页记 / browser clipping → Anki Inbox). The product core begins immediately after capture.
+
+### Formal Item Processing Lifecycle
+
+To prevent ambiguity and eliminate guessing from generic "Anki new card" status, capture items follow an explicit conceptual lifecycle:
+
+```text
+captured
+↓
+untriaged
+↓
+triaged
+↓
+planned
+↓
+learning
+↓
+active / reference / ignored / mastered
+```
+
+Lifecycle state definitions:
+
+- `captured`: Raw material ingested from browser clipping (e.g. 网页记), notes, or web clipping into the Anki Inbox.
+- `untriaged`: Ingested into the system but not yet analyzed or routed by the AI Teacher.
+- `triaged`: Evaluated by AI Teacher and assigned a specific Learning Treatment (`Reference`, `Understand`, `Remember`, `Apply`, `Practice`, `Ignore`).
+- `planned`: Selected by the Daily Learning Orchestrator and budgeted into today's learning plan.
+- `learning`: Currently active in an oral tutoring session with the Voice Tutor.
+- Terminal / Steady states:
+  - `active`: In active spaced retrieval or ongoing application loops.
+  - `reference`: Preserved for future query/lookup without memory burden.
+  - `ignored`: Filtered out of active study queues as currently low value.
+  - `mastered`: Demonstrated durable retrieval, explanation, and transfer evidence.
+
+MVP implementation note: This is the canonical domain model. The MVP does not need to expose or persist every intermediate state in code at once, but all product components must align with this lifecycle.
+
+## 40. AI TEACHER TRIAGE & KNOWLEDGE ROUTING (TREATMENT MODEL) — LOCKED
+
+Core principle: **Entering Anki ≠ automatically entering review.**
+
+The capture layer continues to use low-friction tools (such as 网页记 → Anki Inbox). The core product value begins immediately after capture, where the AI Teacher decides what is worth learning and how it should be treated.
+
+### Triage Evaluation Dimensions
+
+When analyzing newly captured items, the AI Teacher evaluates:
+
+1. **Content itself**: intrinsic structure, complexity, clarity, and whether it represents factual recall, conceptual understanding, or procedural skill.
+2. **Learner intent / declared goals**: the learner's explicit learning objectives, career focus, or immediate context.
+3. **Durable Learner Model**: current mastery strengths, active cognitive load, and known prerequisite gaps.
+4. **Historical learning evidence**: past performance on related topics and concepts.
+5. **Current pedagogical value**: timeliness, relevance, and ROI of investing study time now.
+
+### MVP Learning Treatments
+
+The AI Teacher routes every knowledge unit to one of six canonical treatments:
+
+```text
+Reference
+Understand
+Remember
+Apply
+Practice
+Ignore
+```
+
+Semantic definitions:
+
+- `Reference`: Preserved for future query and information lookup; creates zero active memory burden and does not enter spaced review.
+- `Understand`: Requires conceptual comprehension and mental model formation, but does not default to long-term active unaided retrieval requirements.
+- `Remember`: Requires independent retrieval and active recall; enters the spaced memory review loop (Anki/FSRS).
+- `Apply`: Requires application in novel contexts, case studies, counterfactuals, or practical problems beyond verbatim recall.
+- `Practice`: Requires real oral/procedural performance with feedback and iterative retries (e.g. communication rubrics, interviews, spontaneous phrasing).
+- `Ignore`: Assessed as not worth spending learning time on under current goals; excluded from study queues.
+
+### Multi-Object Decomposition
+
+A single captured source note or clipping may contain multiple distinct knowledge points. The AI Teacher may decompose one source into multiple knowledge objects and assign different treatments to each (e.g. key formula → `Remember`, underlying rationale → `Understand`, API signature snippet → `Reference`).
+
+### Pedagogical Routing vs. Anki Reviews — Hard Boundary
+
+Triage is strictly pedagogical routing and curriculum management. **Triage must NEVER fabricate or simulate Anki reviews.**
+
+- `Reference` and `Ignore` items must not be marked or dismissed using fake `Good` review ratings in Anki.
+- Non-review items must not alter FSRS scheduling parameters or pollute memory retention statistics.
+
+### Learner Authority & Explicit Override
+
+The learner retains ultimate authority over treatment decisions:
+
+- *"这个我要记住"* → override to `Remember`
+- *"这个工作里我要会用"* → override to `Apply` or `Practice`
+- *"这个不用学"* → override to `Reference` or `Ignore`
+
+### Treatment Mutability & Dynamic Evolution
+
+A treatment is an active pedagogical state, not a permanent static label. It evolves dynamically as learner evidence accumulates:
+
+```text
+Understand → Remember (once understood, promoted to active retention)
+Remember → Apply (once recall is fluent, escalated to application)
+Apply → Practice (escalated to oral/procedural mastery)
+Remember → Reference (deprioritized if no longer relevant to active goals)
+```
+
+## 41. DAILY LEARNING ORCHESTRATOR (TIME-BUDGETED PEDAGOGY) — LOCKED
+
+A new formal product layer: **Daily Learning Orchestrator (每日学习编排器)**.
+
+### Purpose & Philosophy
+
+The learner should never have to open Anki to pick cards or face a paralyzing backlog. Instead, the AI Teacher prepares the lesson before the learner arrives ("Teacher lesson prep").
+
+Canonical daily orchestration flow:
+
+```text
+网页记 / Anki Inbox
+↓
+Scan unprocessed / untriaged items
+↓
+AI Teacher Triage (assign treatments)
+↓
+Inspect Inputs:
+- Anki due items (FSRS retrievability / scheduling priority)
+- Newly captured / triaged items
+- Durable Learner Model (mastery states, strengths, gaps)
+- Recent weak points / unresolved misconceptions
+- Learner goals / current relevance
+↓
+Daily Learning Orchestrator
+↓
+Generate today's ≤30 min Daily Learning Plan
+↓
+Voice Tutor Classroom
+```
+
+### Time-Budgeted Pedagogy (Default: 30 Minutes Maximum)
+
+The Daily Learning Orchestrator solves a fundamentally different problem than traditional flashcard schedulers:
+
+- **Not:** *"What all exists to learn today?"* (which leads to infinite backlog anxiety)
+- **Instead:** *"Given a hard budget of 30 minutes today, what is most worth learning?"*
+
+Even if hundreds of cards are due or dozens of new articles are captured, the system must never dump everything into the daily session. The Orchestrator strictly prioritizes candidates based on:
+1. pedagogical value;
+2. forgetting risk / retrievability decay;
+3. learner weak points and unresolved gaps;
+4. alignment with recent goals.
+
+### Illustrative Daily Plan Allocation (Adaptive, Not Hardcoded)
+
+Within a 30-minute budget, the Orchestrator balances review, repair, new learning, and performance:
+
+```text
+30-minute budget (illustrative breakdown):
+├── ~10 min → High-value due retrieval (preventing memory decay on core items)
+├── ~8 min  → Recent weak points / misconception repair
+├── ~7 min  → High-value new Remember / Apply items
+└── ~5 min  → One targeted Practice / application challenge
+```
+
+This distribution is adaptive based on the learner's current state and active goals, not a rigid formula.
+
+### Session Extension Protocol
+
+When the planned 30 minutes are completed, the Tutor informs the learner:
+
+> *"今天计划的 30 分钟学习已经完成。"*
+
+The Tutor must not forcefully terminate. If the learner chooses to extend (e.g. *"再学半小时"*), the Orchestrator dynamically generates an extension plan based on:
+
+```text
+remaining candidates
++ latest in-session learner evidence
++ additional 30 min budget
+```
+
+The system must never mechanically continue down a static queue. Every extension is a freshly budgeted pedagogical decision.
+
+## 42. DAILY PREPARATION & PROACTIVE NOTIFICATION UX — LOCKED DIRECTION
+
+### Principle: Preparation Happens Before the Learner Arrives
+
+The AI Teacher does not start thinking when the user opens the app. Lesson preparation occurs asynchronously before the learner's daily routine begins.
+
+### Commute-Aligned Operating Schedule
+
+Target daily UX timeline:
+
+```text
+Before 08:00 America/Chicago:
+- Background scan of Anki Inbox and capture feeds
+- AI Teacher Triage on unprocessed items
+- Orchestrator builds today's ≤30 min Learning Plan
+
+08:00 America/Chicago:
+- Prompt/notify learner that today's plan is ready
+- Matches morning commute window (eyes-busy, hands-busy, voice-available)
+```
+
+Target frictionless interaction:
+
+```text
+08:00
+Tutor: “今天的 30 分钟学习已经准备好了。”
+
+Learner:
+“开始复习”
+
+→ Voice Tutor immediately begins teaching today's first planned unit.
+```
+
+### Technical Implementation Boundary
+
+Product requirements for daily preparation and proactive prompting are LOCKED. The specific delivery mechanism (macOS LaunchAgent daemon, Anki desktop add-on, ChatGPT proactive reminder, push notification) is an implementation decision / technical experiment and is not constrained to a single transport.
+
+## 43. SYSTEM BOUNDARIES & EXPLICIT NON-GOALS — LOCKED
+
+To protect product focus and maintain velocity, the following are explicit NON-GOALS for the current system:
+
+- **No full standalone Knowledge Graph**: We do not build an elaborate graph database or graph visualization platform.
+- **No Vector DB / Heavyweight RAG Platform**: The system relies on structured Learner Models, Anki note metadata, and atomic Tutor Overlays rather than unbounded vector similarity search.
+- **No Gamification Bloat**: No streaks, badges, points, leaderboards, or artificial engagement mechanics.
+- **No Social Learning / Feeds**: No social sharing, community decks, or public activity streams.
+- **No Recommendation Discovery Feed**: The system teaches what the user captures and needs; it is not a content discovery engine.
+- **No New Capture App**: Capture continues to reuse existing lightweight tooling (e.g. 网页记 / browser clipping → Anki Inbox).
+- **No Replacement for Anki**: Anki/FSRS remains the long-term backend memory infrastructure. The product builds the Teacher/Tutor intelligence layer on top.
+
+Core focus remains strictly: **Pedagogical intelligence and voice tutoring AFTER capture.**
