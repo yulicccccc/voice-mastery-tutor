@@ -112,6 +112,17 @@ class ActionsApiTests(unittest.TestCase):
         self.assertTrue(payload["has_study_session"])
         self.assertEqual(self.service.calls, [("get_study_session", {})])
 
+    def test_study_session_exposes_compact_triage_mode(self) -> None:
+        status, payload = self.request(
+            "/v1/study-session", {"mode": "triage"}, token="test-secret"
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["has_study_session"])
+        self.assertEqual(
+            self.service.calls,
+            [("get_study_session", {"mode": "triage"})],
+        )
+
     def test_record_review_only_delegates_to_durable_record_api(self) -> None:
         status, payload = self.request(
             "/v1/review-result",
@@ -244,6 +255,13 @@ class ActionsApiTests(unittest.TestCase):
             ]["enum"],
             ["teacher", "learner_override"],
         )
+        study_session_properties = schema["paths"]["/v1/study-session"]["post"][
+            "requestBody"
+        ]["content"]["application/json"]["schema"]["properties"]
+        self.assertEqual(
+            study_session_properties["mode"]["enum"], ["full", "triage"]
+        )
+        self.assertEqual(study_session_properties["mode"]["default"], "full")
 
 
 if __name__ == "__main__":

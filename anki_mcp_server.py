@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Any, Literal, TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -39,6 +41,9 @@ DEFAULT_DECK = os.environ.get("ANKI_DEFAULT_DECK", "000-WuCai Inbox")
 ANKICONNECT_VERSION = 6
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("ANKICONNECT_TIMEOUT", "8"))
 MAX_CARDS_PER_CALL = 100
+MAX_TRIAGE_FIELDS_PER_CARD = 5
+MAX_TRIAGE_FIELD_CHARS = 400
+MAX_TRIAGE_CONTENT_CHARS_PER_CARD = 1200
 ANKI_REVIEW_WRITEBACK_ENABLED = os.environ.get(
     "ANKI_REVIEW_WRITEBACK_ENABLED", "false"
 ).lower() in {"1", "true", "yes"}
@@ -51,6 +56,35 @@ class TriageResultInput(TypedDict):
     ]
     source: Literal["teacher", "learner_override"]
     reason: str
+
+
+class _CompactTextExtractor(HTMLParser):
+    """Extract visible text while discarding style and media bodies."""
+
+    _ignored_tags = {"audio", "script", "style", "svg", "video"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if self._ignored_depth or tag.casefold() in self._ignored_tags:
+            self._ignored_depth += 1
+        elif tag.casefold() in {"br", "div", "li", "p", "tr"}:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._ignored_depth:
+            self._ignored_depth -= 1
+        elif tag.casefold() in {"div", "li", "p", "tr"}:
+            self.parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.parts.append(data)
 
 mcp = FastMCP("voice-mastery-tutor")
 _tutor_engine = TutorEngine(JsonlLearnerStore())
@@ -156,6 +190,112 @@ def _teacher_card(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _plain_triage_text(value: Any) -> str:
+    extractor = _CompactTextExtractor()
+    extractor.feed("" if value is None else str(value))
+    extractor.close()
+    text = "".join(extractor.parts)
+    text = re.sub(r"\[sound:[^\]]+\]", " ", text, flags=re.IGNORECASE)
+    return " ".join(text.split())
+
+
+def _compact_triage_fields(fields: Any) -> dict[str, str]:
+    """Keep bounded semantic snippets rather than raw note/card payloads."""
+    if not isinstance(fields, dict):
+        return {}
+
+    noise_markers = {
+        "audio",
+        "css",
+        "link",
+        "media",
+        "sound",
+        "source",
+        "style",
+        "uri",
+        "url",
+    }
+    dictionary_markers = {"add dw", "collins", "dictionary", "glossary"}
+    primary: list[tuple[str, str]] = []
+    fallback: list[tuple[str, str]] = []
+    seen_text: set[str] = set()
+
+    for raw_name, raw_value in fields.items():
+        name = str(raw_name).strip()
+        normalized_name = " ".join(
+            name.casefold().replace("_", " ").replace("-", " ").split()
+        )
+        if not name or any(marker in normalized_name for marker in noise_markers):
+            continue
+        text = _plain_triage_text(raw_value)
+        fingerprint = text.casefold()
+        if not text or fingerprint in seen_text:
+            continue
+        seen_text.add(fingerprint)
+        target = (
+            fallback
+            if any(marker in normalized_name for marker in dictionary_markers)
+            else primary
+        )
+        target.append((name[:80], text))
+
+    result: dict[str, str] = {}
+    remaining = MAX_TRIAGE_CONTENT_CHARS_PER_CARD
+    for name, text in primary + fallback:
+        if len(result) >= MAX_TRIAGE_FIELDS_PER_CARD or remaining <= 0:
+            break
+        limit = min(MAX_TRIAGE_FIELD_CHARS, remaining)
+        if len(text) > limit:
+            text = text[: max(1, limit - 1)].rstrip() + "…"
+        result[name] = text
+        remaining -= len(text)
+    return result
+
+
+def _compact_triage_response(
+    session: dict[str, Any], triage: dict[str, Any]
+) -> dict[str, Any]:
+    effective = triage["effective_results"]
+    cards = []
+    for position, card in enumerate(session["cards"], start=1):
+        card_id = int(card["card_id"])
+        event = effective.get(str(card_id))
+        triage_state = None
+        if event is not None:
+            triage_state = {
+                "treatment": event["treatment"],
+                "source": event["source"],
+                "reason": _plain_triage_text(event.get("reason", ""))[:400],
+            }
+        cards.append(
+            {
+                "position": position,
+                "card_id": card_id,
+                "note_id": int(card["note_id"]),
+                "deck": str(card.get("deck", "")),
+                "model": str(card.get("model", "")),
+                "content_fields": _compact_triage_fields(card.get("fields")),
+                "triage": triage_state,
+            }
+        )
+
+    def card_ids(key: str) -> list[int]:
+        return [int(card["card_id"]) for card in triage[key]]
+
+    return {
+        "has_study_session": True,
+        "mode": "triage",
+        "session_id": str(session["session_id"]),
+        "candidate_count": len(cards),
+        "triage_complete": triage["triage_complete"],
+        "cards": cards,
+        "untriaged_card_ids": card_ids("untriaged_cards"),
+        "active_card_ids": card_ids("active_learning_cards"),
+        "reference_card_ids": card_ids("reference_cards"),
+        "ignored_card_ids": card_ids("ignored_cards"),
+    }
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Read due Anki cards",
@@ -209,23 +349,35 @@ def get_due_cards(deck: str = DEFAULT_DECK, limit: int = 20) -> dict[str, Any]:
         openWorldHint=False,
     )
 )
-def get_study_session(session_id: str | None = None) -> dict[str, Any]:
+def get_study_session(
+    session_id: str | None = None,
+    mode: Literal["full", "triage"] = "full",
+) -> dict[str, Any]:
     """Load an Anki-created card batch and its durable local progress.
 
     With no ID, this returns the latest immutable candidate batch plus durable
     triage-derived queues. Untriaged cards must be classified before teaching;
-    only the active learning cards are included in the Voice handoff. This
+    only the active learning cards are included in the Voice handoff. Use triage
+    mode to read bounded semantic snippets without the full Voice payload. This
     operation never modifies Anki or local learner state.
     """
+    if mode not in {"full", "triage"}:
+        raise ValueError("mode must be full or triage")
     session = _study_session_store.load(session_id)
     if session is None:
-        return {
+        missing = {
             "has_study_session": False,
             "session_id": session_id,
             "cards": [],
         }
+        if mode == "triage":
+            missing["mode"] = "triage"
+        return missing
 
     triage = _tutor_engine.build_triage_view(session["cards"])
+    if mode == "triage":
+        return _compact_triage_response(session, triage)
+
     active_cards = triage["active_learning_cards"]
     card_ids = [int(card["card_id"]) for card in active_cards]
     progress = _tutor_engine.build_session_progress(

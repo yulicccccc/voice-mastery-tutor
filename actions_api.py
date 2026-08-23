@@ -180,15 +180,20 @@ def _openapi_schema(base_url: str) -> dict[str, Any]:
                 "Load candidates and derive the active learning queue",
                 (
                     "Load the immutable candidate batch and durable triage state. "
-                    "Triage every untriaged card first, persist the batch, then call "
-                    "again and use only active_learning_cards/voice_handoff. Never "
-                    "changes Anki."
+                    "Use mode=triage for compact classification content. After "
+                    "triage is persisted, use mode=full for active learning and "
+                    "voice_handoff. Never changes Anki."
                 ),
                 {
                     "session_id": {
                         "type": ["string", "null"],
                         "pattern": "^study_[0-9a-f]{32}$",
-                    }
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["full", "triage"],
+                        "default": "full",
+                    },
                 },
                 [],
             ),

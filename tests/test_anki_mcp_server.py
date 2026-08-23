@@ -225,6 +225,10 @@ class StudySessionToolTests(unittest.TestCase):
         self.assertFalse(annotations.destructiveHint)
         self.assertTrue(annotations.idempotentHint)
         self.assertFalse(annotations.openWorldHint)
+        self.assertEqual(
+            tools["get_study_session"].inputSchema["properties"]["mode"]["enum"],
+            ["full", "triage"],
+        )
 
     def test_active_session_and_progress_are_recovered_without_anki(self) -> None:
         with TemporaryDirectory() as directory:
@@ -309,6 +313,100 @@ class StudySessionToolTests(unittest.TestCase):
 
 
 class TeacherTriageToolTests(unittest.TestCase):
+    def test_compact_triage_mode_bounds_oversized_dictionary_cards(self) -> None:
+        with TemporaryDirectory() as directory:
+            session_id = "study_" + "e" * 32
+            card_ids = (201, 202, 203, 204, 205)
+            session_store = write_session(
+                directory,
+                session_id=session_id,
+                card_ids=card_ids,
+            )
+            manifest_path = session_store.sessions_directory / f"{session_id}.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            semantic_fields = (
+                {
+                    "Expression": "Reduce friction in an existing behavior",
+                    "Meaning": "Remember this transferable product principle",
+                },
+                {
+                    "Title": "Quarterly market-size statistic",
+                    "Usage": "Reference data for lookup, not durable recall",
+                },
+                {
+                    "Skill": "Dance transition timing",
+                    "Task": "Practice the movement until it is reliable",
+                },
+                {"Question": "Why did the assay fail?", "Answer": "Understand cause"},
+                {"Prompt": "Apply the framework", "Context": "Own-work example"},
+            )
+            giant_dictionary = (
+                "<div><b>dictionary detail</b> " + "example " * 10_000 + "</div>"
+            )
+            for card, semantic in zip(manifest["cards"], semantic_fields):
+                card["fields"] = {
+                    **semantic,
+                    "Style": "<style>body { color: red; }</style>" + "x" * 20_000,
+                    "Audio": "[sound:dictionary-entry.mp3]",
+                    "URL": "https://example.invalid/dictionary-entry",
+                    "DictionaryHTML": giant_dictionary,
+                    "Glossary": giant_dictionary,
+                }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            before_manifest = session_store.load(session_id)
+            engine = TutorEngine(
+                JsonlLearnerStore(Path(directory) / "tutor.jsonl")
+            )
+            review_store = SqliteReviewStore(Path(directory) / "reviews.sqlite3")
+
+            with (
+                patch.object(server, "_study_session_store", session_store),
+                patch.object(server, "_tutor_engine", engine),
+                patch.object(server, "_review_store", review_store),
+                patch.object(server, "_anki_call") as anki_call,
+            ):
+                server.record_triage_results(
+                    session_id=session_id,
+                    results=[
+                        {
+                            "card_id": 202,
+                            "treatment": "reference",
+                            "source": "teacher",
+                            "reason": "lookup material",
+                        }
+                    ],
+                )
+                full = server.get_study_session(session_id)
+                compact = server.get_study_session(session_id, mode="triage")
+
+            full_bytes = len(json.dumps(full, ensure_ascii=False).encode("utf-8"))
+            compact_json = json.dumps(compact, ensure_ascii=False)
+            compact_bytes = len(compact_json.encode("utf-8"))
+            anki_call.assert_not_called()
+            self.assertGreater(full_bytes, 100_000)
+            self.assertLess(compact_bytes, 20_000)
+            self.assertEqual(
+                [card["card_id"] for card in compact["cards"]], list(card_ids)
+            )
+            self.assertEqual(compact["candidate_count"], 5)
+            self.assertEqual(compact["cards"][1]["triage"]["treatment"], "reference")
+            self.assertEqual(compact["reference_card_ids"], [202])
+            compact_text = [
+                " ".join(card["content_fields"].values()).casefold()
+                for card in compact["cards"]
+            ]
+            self.assertIn("transferable product principle", compact_text[0])
+            self.assertIn("reference data for lookup", compact_text[1])
+            self.assertIn("practice the movement", compact_text[2])
+            self.assertNotIn("body { color: red; }", compact_json)
+            self.assertNotIn("[sound:", compact_json)
+            self.assertNotIn("https://example.invalid", compact_json)
+            self.assertNotIn("<div>", compact_json)
+            self.assertIn("DictionaryHTML", compact["cards"][0]["content_fields"])
+            self.assertNotIn("Glossary", compact["cards"][0]["content_fields"])
+            self.assertEqual(session_store.load(session_id), before_manifest)
+            self.assertEqual(review_store.list_for_session(session_id), [])
+
     def test_batch_triage_derives_queues_without_touching_manifest_anki_or_reviews(
         self,
     ) -> None:
