@@ -210,17 +210,12 @@ class VoiceTutorDialog(QDialog):
         )
 
         self.deck_list = QListWidget()
-        selected = set(_config()["decks"])
         for deck in sorted(
             mw.col.decks.all_names_and_ids(), key=lambda item: item.name.casefold()
         ):
             item = QListWidgetItem(deck.name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(
-                Qt.CheckState.Checked
-                if deck.name in selected
-                else Qt.CheckState.Unchecked
-            )
+            item.setCheckState(Qt.CheckState.Unchecked)
             self.deck_list.addItem(item)
         layout.addWidget(self.deck_list)
 

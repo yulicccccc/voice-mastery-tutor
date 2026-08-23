@@ -94,6 +94,25 @@ class StudySessionTests(unittest.TestCase):
                 store.load(first["session_id"])["session_id"], first["session_id"]
             )
 
+    def test_candidate_manifest_rejects_cards_outside_selected_deck_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            candidate_queue = queue()
+            candidate_queue["decks"] = ["Selected Deck"]
+            candidate_queue["cards"][0]["deck"] = "Selected Deck"
+            candidate_queue["cards"][1]["deck"] = "Other Deck"
+
+            with self.assertRaisesRegex(ValueError, "selected deck scope"):
+                WRITER.create_study_session(
+                    candidate_queue,
+                    requested_count=2,
+                    include_new=False,
+                    data_directory=directory,
+                )
+
+            self.assertFalse(
+                (Path(directory) / "active-study-session.json").exists()
+            )
+
     def test_invalid_session_id_cannot_escape_session_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StudySessionStore(directory)

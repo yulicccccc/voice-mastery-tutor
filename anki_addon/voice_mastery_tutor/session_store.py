@@ -54,14 +54,28 @@ def create_study_session(
 ) -> dict[str, Any]:
     if requested_count < 1 or requested_count > 20:
         raise ValueError("requested_count must be between 1 and 20")
+    selected_decks = [str(deck).strip() for deck in queue.get("decks", [])]
+    selected_decks = list(dict.fromkeys(deck for deck in selected_decks if deck))
+    if not selected_decks:
+        raise ValueError("study session requires at least one selected deck")
+
+    def card_is_in_selected_scope(card_deck: str) -> bool:
+        return any(
+            card_deck == selected or card_deck.startswith(f"{selected}::")
+            for selected in selected_decks
+        )
+
     session_id = f"study_{uuid4().hex}"
     cards = []
     for card in queue.get("cards", []):
+        card_deck = str(card["deck"])
+        if not card_is_in_selected_scope(card_deck):
+            raise ValueError("candidate card is outside the selected deck scope")
         cards.append(
             {
                 "card_id": int(card["card_id"]),
                 "note_id": int(card["note_id"]),
-                "deck": str(card["deck"]),
+                "deck": card_deck,
                 "model": str(card["model"]),
                 "fields": {
                     str(name): str(value)
@@ -87,7 +101,7 @@ def create_study_session(
         "session_id": session_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
-        "decks": list(queue["decks"]),
+        "decks": selected_decks,
         "requested_count": requested_count,
         "include_new": bool(include_new),
         "selection_method": str(queue["selection_method"]),
