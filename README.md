@@ -15,20 +15,53 @@ ChatGPT
   -> desktop Anki
 ```
 
-On 2026-08-13 a normal ChatGPT conversation invoked `get_due_cards` and returned the same real local Anki data seen by the local smoke test (`total_due=8`, `returned=5`). On 2026-08-17, one disposable card separately validated the local Good-review path through AnkiConnect's scheduler-backed `answerCards` action, including confirmed success and duplicate-sync protection.
+On 2026-08-13 a normal ChatGPT conversation invoked `get_due_cards` and returned the same real local Anki data seen by the local smoke test (`total_due=8`, `returned=5`). On 2026-08-17, disposable cards separately validated the local Good and Again review paths through AnkiConnect's scheduler-backed `answerCards` action, including confirmed success and duplicate-sync protection. The Teacher Triage MVP was later validated through a fresh ChatGPT conversation: durable triage state and learner overrides were recovered without reclassifying the candidate batch or creating ReviewEvents.
 
-Still unvalidated: ChatGPT **voice-mode** tool invocation, ChatGPT custom-app invocation of the write tools, Again/batch review write-back, and all Anki note/content write-back.
+The current daily path is private GPT Actions -> local Actions API -> Cloudflare Quick Tunnel -> desktop Anki. Still unvalidated: direct Custom Action invocation inside ChatGPT **Voice Mode**, sustained multi-card production review write-back, and all Anki note/content write-back.
 
-## MCP tools
+## Tutor tools
 
-The bridge exposes four narrowly scoped tools:
+The bridge exposes narrowly scoped tools:
 
-- `get_due_cards(deck="000-WuCai Inbox", limit=20)` — returns teacher-facing note fields plus card scheduling metadata. It intentionally omits Anki's rendered `question`/`answer` HTML because source note fields are cleaner and more useful for tutoring.
+- `get_due_cards(deck="<deck-name>", limit=20)` — returns teacher-facing note fields plus card scheduling metadata. It intentionally omits Anki's rendered `question`/`answer` HTML because source note fields are cleaner and more useful for tutoring.
+- `get_study_session(session_id=None)` — loads the latest Anki-created batch, its selected card content, scheduler snapshots, and durable progress. The Anki dialog supports one or more decks and a user-selected count from 1–20; 5 is only the default.
+- `record_triage_results(session_id, results)` — appends one durable batch of Teacher Triage decisions without rewriting the StudySession or changing Anki.
+- `get_tutor_context(card_id)` — reconstructs compact card-level teaching memory independently of a ChatGPT transcript.
 - `decide_tutor_next_step(...)` — applies the lightweight-first Tutor policy and appends learner evidence to a local JSONL event log without changing Anki.
 - `record_review_result(...)` — durably records exactly one ReviewEvent for a completed interaction. First-attempt success maps to Good; first-attempt failure maps to Again. It does not call Anki.
-- `sync_pending_reviews(dry_run=true)` — checks pending ReviewEvents and scheduler snapshots. Real scheduler calls require both `dry_run=false` and `ANKI_REVIEW_WRITEBACK_ENABLED=true`.
+- `sync_pending_reviews(dry_run=true, session_id=None)` — checks pending ReviewEvents and scheduler snapshots, optionally restricted to one batch. Real scheduler calls require both `dry_run=false` and `ANKI_REVIEW_WRITEBACK_ENABLED=true`.
 
 The Anki read tool declares read-only safety hints. Tutor and ReviewEvent tools accurately declare their local writes as non-destructive and closed-world.
+
+The private GPT Actions schema exposes exactly seven operation IDs:
+
+```text
+getDueCards
+getStudySession
+getTutorContext
+recordTriageResults
+decideTutorNextStep
+recordReviewResult
+syncPendingReviews
+```
+
+Teacher Triage keeps three layers separate:
+
+```text
+immutable Candidate StudySession
+  -> untriaged cards
+  -> Teacher Triage
+  -> durable triage_result events
+  -> derived active/reference/ignored queues
+```
+
+The active treatments are `understand`, `remember`, `apply`, and `practice`.
+`reference` and `ignore` remain in the immutable candidate material but are
+excluded from active learning. Effective treatment is the latest
+`learner_override` when present, otherwise the latest Teacher result. Triage
+creates no ReviewEvent and never touches the Anki scheduler. A fresh ChatGPT
+conversation recovers the durable triage state instead of classifying the same
+cards again.
 
 ## Local setup
 
@@ -49,7 +82,7 @@ python -m pip install -r requirements.txt
 python smoke_test_anki.py
 ```
 
-Success means the smoke test prints the due count and real card IDs/field names from `000-WuCai Inbox`.
+Success means the smoke test prints the due count and real card IDs/field names from the configured deck.
 
 ## Full ChatGPT ↔ local Anki rebuild guide
 
@@ -76,9 +109,22 @@ Do not reproduce the tunnel work on a managed corporate computer if endpoint-sec
 
 ## Safety boundary for this milestone
 
-Anki reads and `record_review_result` do not mutate Anki. Tutor decisions use a local append-only JSONL store; ReviewEvents use a local SQLite queue with stable event IDs. `sync_pending_reviews` defaults to dry-run, and real review write-back is disabled unless `ANKI_REVIEW_WRITEBACK_ENABLED=true` is explicitly set for the process.
+Anki reads, triage, and `record_review_result` do not mutate Anki. Tutor and triage decisions use a local append-only JSONL store; ReviewEvents use a local SQLite queue with stable event IDs. `sync_pending_reviews` defaults to dry-run, and real review write-back is disabled unless `ANKI_REVIEW_WRITEBACK_ENABLED=true` is explicitly set for the process.
 
 The one approved Good-path experiment used AnkiConnect's normal scheduler mechanism and did not directly edit due dates, intervals, stability, difficulty, FSRS internals, or note content. Production/batch write-back remains disabled.
+
+## Remote study batch prototype
+
+The Anki add-on under `anki_addon/voice_mastery_tutor/` creates an immutable,
+local study-session manifest when the user clicks **开始今天的复习**. Every batch
+gets a stable `session_id`; earlier manifests are preserved when a new batch is
+created. The private GPT can load that batch from a phone while the Mac, local
+Actions service, and tunnel remain online. Per-card Tutor events and ReviewEvents
+carry the same `session_id`, so later synchronization can be restricted to that
+batch. Creating or studying a batch performs zero Anki scheduler writes.
+
+The cross-device phone flow is implemented but still requires a real phone
+acceptance test before it is considered validated.
 
 ## Product documentation
 

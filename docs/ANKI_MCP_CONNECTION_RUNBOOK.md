@@ -1,7 +1,7 @@
 # Anki ↔ ChatGPT / OpenAI Agent Connection Runbook
 
-**Validated:** 2026-08-17
-**Scope:** local Anki read, durable Tutor state, and controlled review sync
+**Validated:** 2026-08-23
+**Scope:** local Anki read, durable Tutor/Triage state, private GPT Quick Tunnel recovery, and controlled review sync
 **Canonical product record:** Living PRD in Google Drive
 
 This document exists so the integration can be rebuilt on a different computer without relying on chat history.
@@ -19,7 +19,11 @@ This document exists so the integration can be rebuilt on a different computer w
 | Local Tutor policy → JSONL learner state | **UNIT TESTED 2026-08-17** | lightweight/deep decisions, restart recovery, learner override, value skip, and continuity |
 | Durable ReviewEvent queue | **UNIT TESTED 2026-08-17** | stable IDs, restart recovery, duplicate-sync protection, conflict handling, and zero-write dry-run |
 | One disposable card → Good → Anki scheduler | **VALIDATED 2026-08-17** | `answerCards` returned `[true]`; event became applied; immediate retry found zero pending and did not increment reps again |
-| Again, batch, or production review/write-back | **NOT YET VALIDATED / DISABLED** | requires separate approval; default feature flag remains false |
+| One disposable card → Again → Anki scheduler | **VALIDATED 2026-08-17** | `answerCards` used ease 1 exactly once; Tutor retained `prompted_recall`; immediate retry made no second review |
+| Private GPT Action → free Quick Tunnel → local Actions API → durable study session | **VALIDATED 2026-08-19** | GPT editor `getStudySession` reached the Mac as HTTP 200 and recovered the active 10-card batch |
+| Candidate StudySession → Teacher Triage → durable derived queue → fresh ChatGPT conversation | **VALIDATED 2026-08-23** | the new conversation recovered effective treatments and learner overrides without re-triage; Reference/Ignore stayed excluded and ReviewEvent count remained zero |
+| Daily real review write-back on this personal Mac | **USER-ENABLED 2026-08-19** | LaunchAgent and local/public health report `ANKI_REVIEW_WRITEBACK_ENABLED=true`; enabling the flag itself performed no review |
+| Sustained multi-card production review/write-back | **NOT YET VALIDATED** | requires an explicit user “更新 Anki” run with per-event conflict/idempotency evidence |
 | ChatGPT custom-app/voice invocation of write tools | **NOT YET VALIDATED** | local scheduler feasibility does not prove product-surface invocation |
 | Anki note/content write-back | **DISABLED / OUT OF SCOPE** | no note fields or FSRS internals are edited |
 | Automatic Windows background startup | **NOT VALIDATED** | a managed corporate PC triggered endpoint-security intervention; do not reproduce there |
@@ -54,6 +58,8 @@ models.py
 learner_store.py
 tutor_engine.py
 review_sync.py
+study_session.py
+actions_api.py
 requirements.txt
 smoke_test_anki.py
 README.md
@@ -65,8 +71,10 @@ Current MCP server behavior:
 - Python FastMCP server.
 - stdio MCP transport.
 - Default AnkiConnect endpoint: `http://127.0.0.1:8765`.
-- Default deck: `000-WuCai Inbox`.
-- Tools: `get_due_cards`, `decide_tutor_next_step`, `record_review_result`, and
+- Due-card reads require an explicitly configured deck; StudySessions preserve
+  the decks selected in the Anki add-on.
+- Tools: `get_due_cards`, `get_study_session`, `get_tutor_context`,
+  `record_triage_results`, `decide_tutor_next_step`, `record_review_result`, and
   `sync_pending_reviews`.
 - Calls AnkiConnect `findCards`, then `cardsInfo`.
 - Returns `card_id`, `note_id`, model, raw note fields, and scheduling metadata useful to a teacher.
@@ -75,6 +83,10 @@ Current MCP server behavior:
   mutates FSRS state.
 - `decide_tutor_next_step` records local Tutor evidence and never calls
   AnkiConnect.
+- `record_triage_results` appends durable Teacher/learner-override treatments.
+  The immutable StudySession is not rewritten; Reference/Ignore are excluded
+  only from the derived active queue. Triage creates no ReviewEvent and never
+  calls AnkiConnect.
 - `record_review_result` creates one durable ReviewEvent per card/scheduler
   snapshot and does not call AnkiConnect. `not_attempted` creates no fake review.
 - `sync_pending_reviews` defaults to dry-run and requires the process-level
@@ -167,7 +179,7 @@ python .\smoke_test_anki.py
 Validated output on 2026-08-13 included:
 
 ```text
-deck=000-WuCai Inbox
+deck=<deck-name>
 total_due=8
 returned=5
 ```
@@ -191,7 +203,7 @@ returned **1909 cards**. That is technically valid but useless as a Tutor queue.
 For tests, scope the query by deck:
 
 ```text
-deck:"000-WuCai Inbox" is:due
+deck:"<deck-name>" is:due
 ```
 
 Observed on the test deck:
@@ -272,7 +284,7 @@ Tools: get_due_cards
 Then request an actual call:
 
 ```text
-Use the anki-local MCP tool get_due_cards with deck="000-WuCai Inbox" and limit=5.
+Use the anki-local MCP tool get_due_cards with deck="<deck-name>" and limit=5.
 ```
 
 Acceptance criterion: Codex must actually call `anki-local.get_due_cards` and return real local Anki card data.
@@ -434,7 +446,7 @@ After changing annotations, refresh/re-scan the custom app tools. ChatGPT may ke
 
 ### Acceptance test inside ordinary ChatGPT
 
-Open a **new normal ChatGPT conversation**, not Codex, select/enable the Anki app if needed, and ask it to read five due cards from `000-WuCai Inbox`.
+Open a **new normal ChatGPT conversation**, not Codex, select/enable the Anki app if needed, and ask it to read five due cards from a configured test deck.
 
 The successful 2026-08-13 ChatGPT test returned:
 
@@ -566,6 +578,8 @@ Use this order. Do not skip ahead to ChatGPT until the lower layer passes.
 
 ### Layer D — Secure MCP Tunnel
 
+This is the historical official OpenAI workspace-tunnel route. It may require workspace/organization permissions. For the current free personal-Mac path, use Section 16 instead.
+
 - [ ] Download official tunnel-client for the machine architecture.
 - [ ] Create/reuse a Platform tunnel associated with the correct ChatGPT workspace.
 - [ ] Create a restricted runtime key; store it safely.
@@ -581,7 +595,7 @@ Use this order. Do not skip ahead to ChatGPT until the lower layer passes.
 - [ ] Scan/refresh tools.
 - [ ] Confirm `get_due_cards` is classified as read-only/non-destructive.
 - [ ] Open a new normal ChatGPT conversation.
-- [ ] Ask for five due cards from `000-WuCai Inbox`.
+- [ ] Ask for five due cards from a configured test deck.
 - [ ] Confirm the tool really runs and returns the same real card IDs/data.
 
 ### Layer F — product-specific next test
@@ -612,3 +626,135 @@ The next bottlenecks are:
 2. Can the Tutor transform messy teacher-facing cards into good atomic oral Tutor Units?
 3. Can learner progress / insights persist safely?
 4. Can review outcomes later be written back without corrupting Anki/FSRS semantics?
+
+---
+
+## 16. Current personal-Mac path — free Quick Tunnel + private GPT Action
+
+This is the current daily operating path. It avoids a paid OpenAI Business workspace/organization tunnel while keeping ChatGPT as the learner-facing classroom.
+
+```text
+Desktop Anki
+  -> local Anki access on 127.0.0.1:28765
+  -> Tutor Actions API on 127.0.0.1:28766
+  -> Cloudflare Quick Tunnel (*.trycloudflare.com)
+  -> private GPT Action
+  -> ordinary ChatGPT desktop/mobile conversation
+```
+
+### 16.1 Persistent services
+
+- The Actions API LaunchAgent runs the private Actions API.
+- The tunnel LaunchAgent runs `cloudflared`.
+- The tunnel LaunchAgent must call `scripts/run_quick_tunnel.zsh`. Do not use `scripts/run_gateway_tunnel.zsh` merely to restart the free tunnel because that script also updates the separate Worker origin.
+- The public tunnel forwards only to `127.0.0.1:28766`; it must never become a general proxy for arbitrary AnkiConnect methods.
+
+### 16.2 Authentication
+
+The GPT Action credential is a Tutor-specific Bearer token, not an OpenAI API key. It does not call OpenAI models or create OpenAI API charges.
+
+- macOS Keychain service: `voice-mastery-tutor-actions`
+- GPT Authentication type: `API Key`
+- Auth type: `Bearer`
+- Never print, paste into logs, commit, screenshot, or document the token value.
+
+Important: the GPT editor’s hidden API Key field can be empty after the Action hostname is changed or Authentication is reopened. Saving that empty field removes the credential. Re-enter the Keychain-backed Tutor token before clicking Save, then click Update on the GPT.
+
+### 16.3 Quick Tunnel hostname recovery
+
+A Quick Tunnel hostname belongs to the current `cloudflared` process. The LaunchAgent restarts the process automatically, but a restart can generate a new random hostname. Durable Tutor learner state, study sessions, and ReviewEvents remain intact; only the transport address changes.
+
+Recovery checklist:
+
+1. Confirm local `http://127.0.0.1:28766/health` returns HTTP 200.
+2. Read the new `https://<random>.trycloudflare.com` URL from the tunnel log.
+3. Confirm public `/health` returns HTTP 200.
+4. Confirm public `/openapi.json` uses that exact URL in `servers[0].url` and exposes exactly seven operations:
+   - `getDueCards`
+   - `getStudySession`
+   - `getTutorContext`
+   - `recordTriageResults`
+   - `decideTutorNextStep`
+   - `recordReviewResult`
+   - `syncPendingReviews`
+5. Make one authenticated, read-only `POST /v1/study-session` preflight without printing the Bearer token. Verify the expected active durable session/card count.
+6. In the private GPT editor, replace only the Action schema server URL.
+7. Restore the Tutor Bearer token, Save Authentication, and Update the GPT.
+8. Run the editor `getStudySession` Test. Select `Always allow` for the new hostname.
+9. Accept the recovery only when the local Actions log contains `POST /v1/study-session HTTP/1.1` 200 and the GPT result contains the expected durable `session_id`.
+
+Do not call `recordReviewResult` or `syncPendingReviews` just to test transport.
+
+### 16.4 Error interpretation
+
+| Symptom | Boundary | Next check |
+|---|---|---|
+| `ClientResponseError` and no local POST | ChatGPT Action domain/auth/approval, before the Mac | hostname saved, Bearer restored, new domain allowed |
+| HTTP 401 `missing_or_invalid_bearer_token` | request reached the adapter without the correct Tutor credential | restore Keychain-backed Bearer token |
+| HTTP 502 | request reached the adapter but downstream Tutor/Anki was unavailable | Actions API logs and identity-verified Anki endpoint |
+| HTTP 200 + expected durable session | read path operational | proceed to the normal study flow |
+
+Port responsiveness is not identity proof. Before a real review write, verify the configured local Anki endpoint represents the intended collection/decks rather than an unrelated service impersonating AnkiConnect.
+
+### 16.5 Teacher Triage and cross-conversation recovery
+
+`getStudySession` keeps the candidate material immutable and derives the current
+learning queues from durable triage events:
+
+```text
+immutable Candidate StudySession
+  -> untriaged cards
+  -> Teacher Triage
+  -> durable triage_result events
+  -> derived active/reference/ignored queues
+```
+
+For every untriaged batch, the Teacher calls `recordTriageResults` once with all
+decisions, then reloads `getStudySession`. The active treatments are
+`understand`, `remember`, `apply`, and `practice`; `reference` and `ignore` stay
+in the candidate manifest but do not enter active learning. Effective treatment
+uses the latest `learner_override` when present, otherwise the latest Teacher
+result. A newer learner override may replace an older one while the append-only
+history remains intact.
+
+Triage does not create a ReviewEvent, answer an Anki card, or change the Anki
+scheduler. A fresh ChatGPT conversation recovers the same durable triage state,
+derived queues, and learner overrides. It does not classify already-triaged
+cards again.
+
+### 16.6 Mobile Voice handoff
+
+1. Select the desired decks and 1–20 cards in the Anki add-on.
+2. In the private GPT, say `开始复习我刚刚在 Anki 选择的批次`.
+3. Complete Teacher Triage for any `untriaged_cards`, persist it once, and reload `getStudySession`.
+4. `getStudySession` must embed only the derived active learning cards in the complete voice handoff packet before Voice Mode starts.
+5. Continue the same conversation on the phone in Voice Mode. Per-card Actions are not required while the complete packet is already in the conversation.
+6. When back in text mode, say `保存本次学习` to create durable Tutor/ReviewEvent records.
+7. Say `更新 Anki` only when a real scheduler sync is intended.
+
+The Mac, Actions API, and tunnel must be online for start/save/update Action calls. Once the complete packet is embedded, the spoken teaching portion can continue on the phone without a new Action for every card.
+
+### 16.7 Daily write-back mode
+
+The code remains fail-closed when no environment override is present. On this personal Mac, the user has explicitly approved the LaunchAgent setting:
+
+```text
+ANKI_REVIEW_WRITEBACK_ENABLED=true
+```
+
+Enabling the flag does not review a card. A scheduler write occurs only after the user explicitly says `更新 Anki` and the GPT calls `syncPendingReviews(dry_run=false)` for the active `session_id`.
+
+After changing the flag, restart only the Actions API service. Do not restart the tunnel. Verify the effective value from both local and public `/health`; do not rely on the plist text alone.
+
+All real writes remain subject to:
+
+- current-session scoping;
+- first-attempt rating semantics;
+- durable event idempotency protection;
+- scheduler snapshot conflict detection;
+- confirmed-success-only `pending -> applied` transition;
+- no direct Anki DB, due, interval, stability, difficulty, or FSRS edits;
+- no Anki note/content write through the review-sync path;
+- no fake review for a low-value skip without retrieval.
+
+The private GPT read path is validated. Good and Again scheduler writes are validated on disposable cards. Sustained real multi-card synchronization through the GPT Action is still an acceptance test, not yet a production claim.
