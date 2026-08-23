@@ -1,0 +1,9 @@
+{
+  "dailyTime": "09:00",
+  "timezone": "",
+  "decks": [],
+  "limit": 5,
+  "includeNew": false,
+  "chatgptConversationUrl": "",
+  "lastPromptDate": ""
+}
