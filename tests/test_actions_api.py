@@ -32,6 +32,14 @@ class FakeTutorService:
         self.calls.append(("get_tutor_context", kwargs))
         return {"card_id": kwargs["card_id"], "has_history": True}
 
+    def record_triage_results(self, **kwargs):
+        self.calls.append(("record_triage_results", kwargs))
+        return {
+            "session_id": kwargs["session_id"],
+            "recorded_count": len(kwargs["results"]),
+            "anki_mutated": False,
+        }
+
     def decide_tutor_next_step(self, **kwargs):
         self.calls.append(("decide_tutor_next_step", kwargs))
         return {"state": "prompted_recall", "anki_mutated": False}
@@ -122,6 +130,41 @@ class ActionsApiTests(unittest.TestCase):
             "sync_pending_reviews", [name for name, _ in self.service.calls]
         )
 
+    def test_triage_results_are_sent_in_one_batch(self) -> None:
+        session_id = "study_" + "a" * 32
+        results = [
+            {
+                "card_id": 123,
+                "treatment": "remember",
+                "source": "teacher",
+                "reason": "durable recall is useful",
+            },
+            {
+                "card_id": 124,
+                "treatment": "reference",
+                "source": "teacher",
+                "reason": "lookup material",
+            },
+        ]
+
+        status, payload = self.request(
+            "/v1/triage-results",
+            {"session_id": session_id, "results": results},
+            token="test-secret",
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["recorded_count"], 2)
+        self.assertEqual(
+            self.service.calls,
+            [
+                (
+                    "record_triage_results",
+                    {"session_id": session_id, "results": results},
+                )
+            ],
+        )
+
     def test_sync_defaults_to_dry_run(self) -> None:
         status, payload = self.request(
             "/v1/sync-reviews", {}, token="test-secret"
@@ -170,6 +213,7 @@ class ActionsApiTests(unittest.TestCase):
             "/v1/due-cards",
             "/v1/study-session",
             "/v1/tutor-context",
+            "/v1/triage-results",
             "/v1/next-step",
             "/v1/review-result",
         }
@@ -189,6 +233,16 @@ class ActionsApiTests(unittest.TestCase):
             ["content"]["application/json"]["schema"]["properties"]["dry_run"]
             ["default"],
             True,
+        )
+        triage_schema = schema["paths"]["/v1/triage-results"]["post"][
+            "requestBody"
+        ]["content"]["application/json"]["schema"]
+        self.assertEqual(triage_schema["properties"]["results"]["maxItems"], 100)
+        self.assertEqual(
+            triage_schema["properties"]["results"]["items"]["properties"][
+                "source"
+            ]["enum"],
+            ["teacher", "learner_override"],
         )
 
 

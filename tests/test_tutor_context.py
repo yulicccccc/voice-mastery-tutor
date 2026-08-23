@@ -110,6 +110,33 @@ class TutorContextReconstructionTests(unittest.TestCase):
             context["recommended_resume_target"], "independent_retrieval"
         )
 
+    def test_restart_ignores_triage_events_during_learner_reconstruction(
+        self,
+    ) -> None:
+        self.add_prompted_recall_history(321)
+        expected_context = self.engine.build_tutor_context(321)
+        expected_latest_state = self.engine.latest_state(321)
+        self.store.append(
+            {
+                "event_type": "triage_result",
+                "event_id": "triage_restart_regression",
+                "session_id": "study_" + "a" * 32,
+                "card_id": 321,
+                "note_id": 654,
+                "treatment": "remember",
+                "source": "teacher",
+                "reason": "durable recall is useful",
+                "created_at": "2026-08-23T00:00:00+00:00",
+            }
+        )
+        del self.engine
+        del self.store
+
+        restarted = TutorEngine(JsonlLearnerStore(self.path))
+
+        self.assertEqual(restarted.latest_state(321), expected_latest_state)
+        self.assertEqual(restarted.build_tutor_context(321), expected_context)
+
     def test_no_history_returns_clean_first_retrieval_context(self) -> None:
         self.assertEqual(
             self.engine.build_tutor_context(999),

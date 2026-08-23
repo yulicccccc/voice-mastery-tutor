@@ -13,29 +13,42 @@ from study_session import StudySessionStore
 from tutor_engine import TutorEngine
 
 
-def write_session(directory: str, *, session_id: str) -> StudySessionStore:
+def write_session(
+    directory: str,
+    *,
+    session_id: str,
+    card_ids: tuple[int, ...] = (123,),
+) -> StudySessionStore:
     store = StudySessionStore(directory)
     store.sessions_directory.mkdir(parents=True)
+    cards = []
+    for index, card_id in enumerate(card_ids):
+        snapshot = ReviewToolBoundaryTests.scheduler_snapshot()
+        snapshot["modified"] += index
+        cards.append(
+            {
+                "card_id": card_id,
+                "note_id": card_id + 333,
+                "deck": "000-WuCai Inbox",
+                "model": "Basic",
+                "fields": {
+                    "Prompt": f"Q{card_id}",
+                    "Response": f"A{card_id}",
+                },
+                "scheduler_snapshot": snapshot,
+                "retrievability": 0.4 + index / 10,
+            }
+        )
     manifest = {
         "schema_version": 1,
         "session_id": session_id,
         "created_at": "2026-08-17T12:00:00+00:00",
         "status": "active",
         "decks": ["000-WuCai Inbox"],
-        "requested_count": 1,
+        "requested_count": len(cards),
         "include_new": False,
         "selection_method": "anki-native-fsrs-retrievability",
-        "cards": [
-            {
-                "card_id": 123,
-                "note_id": 456,
-                "deck": "000-WuCai Inbox",
-                "model": "Basic",
-                "fields": {"Prompt": "Q", "Response": "A"},
-                "scheduler_snapshot": ReviewToolBoundaryTests.scheduler_snapshot(),
-                "retrievability": 0.4,
-            }
-        ],
+        "cards": cards,
     }
     (store.sessions_directory / f"{session_id}.json").write_text(
         json.dumps(manifest), encoding="utf-8"
@@ -226,6 +239,17 @@ class StudySessionToolTests(unittest.TestCase):
                 patch.object(server, "_review_store", review_store),
                 patch.object(server, "_anki_call") as anki_call,
             ):
+                server.record_triage_results(
+                    session_id=session_id,
+                    results=[
+                        {
+                            "card_id": 123,
+                            "treatment": "remember",
+                            "source": "teacher",
+                            "reason": "worth retaining",
+                        }
+                    ],
+                )
                 server.decide_tutor_next_step(
                     session_id=session_id,
                     card_id=123,
@@ -282,6 +306,154 @@ class StudySessionToolTests(unittest.TestCase):
             self.assertEqual(
                 review_store.list_by_status(server.ReviewSyncStatus.PENDING), []
             )
+
+
+class TeacherTriageToolTests(unittest.TestCase):
+    def test_batch_triage_derives_queues_without_touching_manifest_anki_or_reviews(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            session_id = "study_" + "c" * 32
+            session_store = write_session(
+                directory,
+                session_id=session_id,
+                card_ids=(123, 124, 125, 126, 127),
+            )
+            before_manifest = session_store.load(session_id)
+            learner_path = Path(directory) / "tutor.jsonl"
+            engine = TutorEngine(JsonlLearnerStore(learner_path))
+            review_store = SqliteReviewStore(Path(directory) / "reviews.sqlite3")
+            with (
+                patch.object(server, "_study_session_store", session_store),
+                patch.object(server, "_tutor_engine", engine),
+                patch.object(server, "_review_store", review_store),
+                patch.object(server, "_anki_call") as anki_call,
+            ):
+                recorded = server.record_triage_results(
+                    session_id=session_id,
+                    results=[
+                        {
+                            "card_id": 123,
+                            "treatment": "reference",
+                            "source": "teacher",
+                            "reason": "lookup material",
+                        },
+                        {
+                            "card_id": 124,
+                            "treatment": "remember",
+                            "source": "teacher",
+                            "reason": "durable recall matters",
+                        },
+                        {
+                            "card_id": 125,
+                            "treatment": "ignore",
+                            "source": "teacher",
+                            "reason": "low value",
+                        },
+                        {
+                            "card_id": 126,
+                            "treatment": "apply",
+                            "source": "teacher",
+                            "reason": "work transfer matters",
+                        },
+                    ],
+                )
+                derived = server.get_study_session(session_id)
+
+            anki_call.assert_not_called()
+            self.assertEqual(recorded["recorded_count"], 4)
+            self.assertEqual(recorded["review_events_created"], 0)
+            self.assertFalse(recorded["candidate_manifest_mutated"])
+            self.assertEqual(session_store.load(session_id), before_manifest)
+            self.assertEqual(
+                [card["card_id"] for card in derived["active_learning_cards"]],
+                [124, 126],
+            )
+            self.assertEqual(
+                [card["card_id"] for card in derived["reference_cards"]], [123]
+            )
+            self.assertEqual(
+                [card["card_id"] for card in derived["ignored_cards"]], [125]
+            )
+            self.assertEqual(
+                [card["card_id"] for card in derived["untriaged_cards"]], [127]
+            )
+            self.assertFalse(derived["triage_complete"])
+            self.assertEqual(derived["voice_handoff"]["card_count"], 2)
+            self.assertEqual(review_store.list_for_session(session_id), [])
+
+    def test_restart_recovers_triage_and_latest_learner_override_wins(self) -> None:
+        with TemporaryDirectory() as directory:
+            session_id = "study_" + "d" * 32
+            session_store = write_session(directory, session_id=session_id)
+            learner_path = Path(directory) / "tutor.jsonl"
+            review_store = SqliteReviewStore(Path(directory) / "reviews.sqlite3")
+            first_engine = TutorEngine(JsonlLearnerStore(learner_path))
+            with (
+                patch.object(server, "_study_session_store", session_store),
+                patch.object(server, "_tutor_engine", first_engine),
+                patch.object(server, "_review_store", review_store),
+                patch.object(server, "_anki_call") as anki_call,
+            ):
+                for index, (treatment, source) in enumerate((
+                    ("remember", "teacher"),
+                    ("practice", "teacher"),
+                    ("ignore", "learner_override"),
+                    ("apply", "teacher"),
+                    ("understand", "learner_override"),
+                )):
+                    server.record_triage_results(
+                        session_id=session_id,
+                        results=[
+                            {
+                                "card_id": 123,
+                                "treatment": treatment,
+                                "source": source,
+                                "reason": f"choose {treatment}",
+                            }
+                        ],
+                    )
+                    if index == 1:
+                        teacher_retriage = server.get_study_session(session_id)
+
+            self.assertEqual(
+                teacher_retriage["triage_results"]["123"]["treatment"],
+                "practice",
+            )
+
+            restarted_engine = TutorEngine(JsonlLearnerStore(learner_path))
+            with (
+                patch.object(server, "_study_session_store", session_store),
+                patch.object(server, "_tutor_engine", restarted_engine),
+                patch.object(server, "_review_store", review_store),
+                patch.object(server, "_anki_call") as restarted_anki_call,
+            ):
+                recovered = server.get_study_session(session_id)
+
+            anki_call.assert_not_called()
+            restarted_anki_call.assert_not_called()
+            self.assertTrue(recovered["triage_complete"])
+            self.assertEqual(
+                recovered["triage_results"]["123"]["treatment"], "understand"
+            )
+            self.assertEqual(
+                recovered["triage_results"]["123"]["source"],
+                "learner_override",
+            )
+            self.assertEqual(
+                [card["card_id"] for card in recovered["active_learning_cards"]],
+                [123],
+            )
+            self.assertEqual(len(JsonlLearnerStore(learner_path).read_all()), 5)
+
+    def test_triage_tool_annotations_match_local_append_only_write(self) -> None:
+        tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+        annotations = tools["record_triage_results"].annotations
+
+        self.assertFalse(annotations.readOnlyHint)
+        self.assertFalse(annotations.destructiveHint)
+        self.assertFalse(annotations.idempotentHint)
+        self.assertFalse(annotations.openWorldHint)
 
 
 if __name__ == "__main__":

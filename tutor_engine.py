@@ -13,6 +13,8 @@ from models import (
     QuestionType,
     TeachingDepth,
     TeachingMethod,
+    TriageEvent,
+    TriageTreatment,
     TutorAction,
     TutorContext,
     TutorDecision,
@@ -121,6 +123,14 @@ RESUME_TARGET_BY_STATE = {
     LearnerState.SKIPPED_LOW_VALUE: "deprioritized_or_skip",
     LearnerState.PAUSED: "resume_when_ready",
 }
+ACTIVE_TRIAGE_TREATMENTS = {
+    TriageTreatment.UNDERSTAND,
+    TriageTreatment.REMEMBER,
+    TriageTreatment.APPLY,
+    TriageTreatment.PRACTICE,
+}
+
+
 class TutorEngine:
     def __init__(self, store: JsonlLearnerStore | None = None) -> None:
         self.store = store
@@ -197,13 +207,66 @@ class TutorEngine:
     def latest_state(self, card_id: int) -> LearnerState | None:
         if self.store is None:
             return None
-        event = self.store.latest_for_card(card_id)
-        if event is None:
-            return None
-        try:
-            return LearnerState(event["state"])
-        except (KeyError, ValueError):
-            return None
+        for event in reversed(self.store.read_card_events(card_id)):
+            try:
+                return LearnerState(event["state"])
+            except (KeyError, ValueError):
+                continue
+        return None
+
+    def record_triage_events(self, events: list[TriageEvent]) -> None:
+        if self.store is None:
+            raise RuntimeError("Tutor learner store is not configured")
+        self.store.append_many([event.to_dict() for event in events])
+
+    def build_triage_view(self, cards: list[dict[str, Any]]) -> dict[str, Any]:
+        """Derive learning queues without changing the candidate manifest."""
+        card_ids = [int(card["card_id"]) for card in cards]
+        effective = (
+            self.store.effective_triage_for_cards(card_ids)
+            if self.store is not None
+            else {}
+        )
+        untriaged: list[dict[str, Any]] = []
+        active: list[dict[str, Any]] = []
+        reference: list[dict[str, Any]] = []
+        ignored: list[dict[str, Any]] = []
+
+        for card in cards:
+            card_id = int(card["card_id"])
+            event = effective.get(card_id)
+            if event is None:
+                untriaged.append(dict(card))
+                continue
+            derived = {
+                **card,
+                "triage": {
+                    "event_id": event.event_id,
+                    "treatment": event.treatment.value,
+                    "source": event.source.value,
+                    "reason": event.reason,
+                    "created_at": event.created_at,
+                },
+            }
+            if event.treatment in ACTIVE_TRIAGE_TREATMENTS:
+                active.append(derived)
+            elif event.treatment == TriageTreatment.REFERENCE:
+                reference.append(derived)
+            else:
+                ignored.append(derived)
+
+        return {
+            "triage_complete": not untriaged,
+            "effective_results": {
+                str(card_id): effective[card_id].to_dict()
+                for card_id in card_ids
+                if card_id in effective
+            },
+            "untriaged_cards": untriaged,
+            "active_learning_cards": active,
+            "reference_cards": reference,
+            "ignored_cards": ignored,
+        }
 
     def build_tutor_context(self, card_id: int) -> dict[str, Any]:
         """Reconstruct compact teaching context from durable events for one card."""

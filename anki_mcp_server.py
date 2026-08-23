@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Literal
+from datetime import datetime, timezone
+from typing import Any, Literal, TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -19,6 +21,9 @@ from models import (
     QuestionType,
     ReviewSyncStatus,
     SchedulerSnapshot,
+    TriageEvent,
+    TriageSource,
+    TriageTreatment,
     TutorContext,
 )
 from review_sync import (
@@ -38,6 +43,14 @@ ANKI_REVIEW_WRITEBACK_ENABLED = os.environ.get(
     "ANKI_REVIEW_WRITEBACK_ENABLED", "false"
 ).lower() in {"1", "true", "yes"}
 
+
+class TriageResultInput(TypedDict):
+    card_id: int
+    treatment: Literal[
+        "reference", "understand", "remember", "apply", "practice", "ignore"
+    ]
+    source: Literal["teacher", "learner_override"]
+    reason: str
 
 mcp = FastMCP("voice-mastery-tutor")
 _tutor_engine = TutorEngine(JsonlLearnerStore())
@@ -199,10 +212,10 @@ def get_due_cards(deck: str = DEFAULT_DECK, limit: int = 20) -> dict[str, Any]:
 def get_study_session(session_id: str | None = None) -> dict[str, Any]:
     """Load an Anki-created card batch and its durable local progress.
 
-    With no ID, this returns the latest batch created from the Anki dialog. The
-    manifest already contains the selected card content and scheduler snapshots,
-    so a phone can continue the same ChatGPT conversation without selecting cards
-    again. This operation never modifies Anki or local learner state.
+    With no ID, this returns the latest immutable candidate batch plus durable
+    triage-derived queues. Untriaged cards must be classified before teaching;
+    only the active learning cards are included in the Voice handoff. This
+    operation never modifies Anki or local learner state.
     """
     session = _study_session_store.load(session_id)
     if session is None:
@@ -212,20 +225,36 @@ def get_study_session(session_id: str | None = None) -> dict[str, Any]:
             "cards": [],
         }
 
-    card_ids = [int(card["card_id"]) for card in session["cards"]]
+    triage = _tutor_engine.build_triage_view(session["cards"])
+    active_cards = triage["active_learning_cards"]
+    card_ids = [int(card["card_id"]) for card in active_cards]
     progress = _tutor_engine.build_session_progress(
         str(session["session_id"]), card_ids
     )
     reviews = _review_store.list_for_session(str(session["session_id"]))
-    reviewed_card_ids = {event.card_id for event in reviews}
+    active_card_ids = set(card_ids)
+    reviewed_card_ids = {
+        event.card_id for event in reviews if event.card_id in active_card_ids
+    }
     durable_completed = reviewed_card_ids | set(progress["skipped_card_ids"])
     teaching_complete = progress["completed_card_ids"]
+    active_session = {**session, "cards": active_cards}
     return {
         **session,
         "has_study_session": True,
-        "voice_handoff": build_voice_handoff(session),
+        "triage_complete": triage["triage_complete"],
+        "triage_results": triage["effective_results"],
+        "untriaged_cards": triage["untriaged_cards"],
+        "active_learning_cards": active_cards,
+        "reference_cards": triage["reference_cards"],
+        "ignored_cards": triage["ignored_cards"],
+        "voice_handoff": build_voice_handoff(active_session),
         "progress": {
             **progress,
+            "candidate_card_ids": [
+                int(card["card_id"]) for card in session["cards"]
+            ],
+            "active_card_ids": card_ids,
             "teaching_complete_card_ids": teaching_complete,
             "completed_card_ids": [
                 card_id for card_id in card_ids if card_id in durable_completed
@@ -233,7 +262,8 @@ def get_study_session(session_id: str | None = None) -> dict[str, Any]:
             "remaining_card_ids": [
                 card_id for card_id in card_ids if card_id not in durable_completed
             ],
-            "complete": all(card_id in durable_completed for card_id in card_ids),
+            "complete": triage["triage_complete"]
+            and all(card_id in durable_completed for card_id in card_ids),
             "review_events": [
                 {
                     "event_id": event.event_id,
@@ -244,6 +274,78 @@ def get_study_session(session_id: str | None = None) -> dict[str, Any]:
                 for event in reviews
             ],
         },
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Record Teacher Triage results for a candidate batch",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+def record_triage_results(
+    session_id: str,
+    results: list[TriageResultInput],
+) -> dict[str, Any]:
+    """Append a batch of local triage decisions without changing Anki.
+
+    Each result requires `card_id`, `treatment`, `source`, and `reason`.
+    Treatment is reference, understand, remember, apply, practice, or ignore;
+    source is teacher or learner_override. The candidate StudySession stays
+    immutable, and this operation creates no ReviewEvent.
+    """
+    session = _study_session_store.load(session_id)
+    if session is None:
+        raise ValueError("study session does not exist")
+    if not isinstance(results, list) or not 1 <= len(results) <= MAX_CARDS_PER_CALL:
+        raise ValueError(
+            f"results must contain between 1 and {MAX_CARDS_PER_CALL} items"
+        )
+
+    cards_by_id = {int(card["card_id"]): card for card in session["cards"]}
+    seen: set[int] = set()
+    events: list[TriageEvent] = []
+    created_at = datetime.now(timezone.utc).isoformat()
+    required = {"card_id", "treatment", "source", "reason"}
+    for result in results:
+        if not isinstance(result, dict) or set(result) != required:
+            raise ValueError(
+                "each result must contain only card_id, treatment, source, and reason"
+            )
+        raw_card_id = result["card_id"]
+        if isinstance(raw_card_id, bool) or not isinstance(raw_card_id, int):
+            raise ValueError("card_id must be a positive integer")
+        card_id = raw_card_id
+        if card_id not in cards_by_id:
+            raise ValueError("card is not part of this study session")
+        if card_id in seen:
+            raise ValueError("a triage batch cannot contain duplicate card ids")
+        seen.add(card_id)
+        reason = str(result["reason"]).strip()
+        events.append(
+            TriageEvent(
+                event_id=f"triage_{uuid4().hex}",
+                session_id=session_id,
+                card_id=card_id,
+                note_id=int(cards_by_id[card_id]["note_id"]),
+                treatment=TriageTreatment(result["treatment"]),
+                source=TriageSource(result["source"]),
+                reason=reason,
+                created_at=created_at,
+            )
+        )
+
+    _tutor_engine.record_triage_events(events)
+    return {
+        "session_id": session_id,
+        "recorded_count": len(events),
+        "results": [event.to_dict() for event in events],
+        "candidate_manifest_mutated": False,
+        "review_events_created": 0,
+        "anki_mutated": False,
     }
 
 

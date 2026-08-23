@@ -177,13 +177,12 @@ def _openapi_schema(base_url: str) -> dict[str, Any]:
             ),
             "/v1/study-session": post_operation(
                 "getStudySession",
-                "Load one complete voice-ready Anki batch",
+                "Load candidates and derive the active learning queue",
                 (
-                    "Load the active durable study session and all selected cards. "
-                    "Before Voice Mode, place voice_handoff.packet_markdown verbatim "
-                    "in the reply, then ask the first question. The embedded packet "
-                    "lets Voice continue through the batch without further Actions. "
-                    "Never changes Anki."
+                    "Load the immutable candidate batch and durable triage state. "
+                    "Triage every untriaged card first, persist the batch, then call "
+                    "again and use only active_learning_cards/voice_handoff. Never "
+                    "changes Anki."
                 ),
                 {
                     "session_id": {
@@ -202,6 +201,55 @@ def _openapi_schema(base_url: str) -> dict[str, Any]:
                 ),
                 {"card_id": {"type": "integer", "minimum": 1}},
                 ["card_id"],
+            ),
+            "/v1/triage-results": post_operation(
+                "recordTriageResults",
+                "Persist one batch of Teacher Triage results",
+                (
+                    "Persist treatments for untriaged candidate cards in one local "
+                    "append-only batch. Never changes the StudySession or Anki."
+                ),
+                {
+                    "session_id": {
+                        "type": "string",
+                        "pattern": "^study_[0-9a-f]{32}$",
+                    },
+                    "results": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": [
+                                "card_id",
+                                "treatment",
+                                "source",
+                                "reason",
+                            ],
+                            "properties": {
+                                "card_id": {"type": "integer", "minimum": 1},
+                                "treatment": {
+                                    "type": "string",
+                                    "enum": [
+                                        "reference",
+                                        "understand",
+                                        "remember",
+                                        "apply",
+                                        "practice",
+                                        "ignore",
+                                    ],
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "enum": ["teacher", "learner_override"],
+                                },
+                                "reason": {"type": "string", "minLength": 1},
+                            },
+                        },
+                    },
+                },
+                ["session_id", "results"],
             ),
             "/v1/next-step": post_operation(
                 "decideTutorNextStep",
@@ -338,6 +386,7 @@ class ActionsRouter:
             ),
             "/v1/study-session": (service.get_study_session, {}),
             "/v1/tutor-context": (service.get_tutor_context, {}),
+            "/v1/triage-results": (service.record_triage_results, {}),
             "/v1/next-step": (service.decide_tutor_next_step, {}),
             "/v1/review-result": (service.record_review_result, {}),
             "/v1/sync-reviews": (

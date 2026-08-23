@@ -17,6 +17,8 @@ from models import (
     ReviewEvent,
     ReviewSyncStatus,
     SchedulerSnapshot,
+    TriageEvent,
+    TriageSource,
 )
 
 
@@ -76,6 +78,33 @@ class JsonlLearnerStore:
         finally:
             os.close(descriptor)
 
+    def append_many(self, events: list[dict[str, Any]]) -> None:
+        """Append one validated batch with a single durable file write."""
+        if not events:
+            return
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._ensure_safe_file_target()
+        body = b"".join(
+            (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
+            for event in events
+        )
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self.path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("Tutor store path must be a regular file")
+            os.fchmod(descriptor, 0o600)
+            written = os.write(descriptor, body)
+            if written != len(body):
+                raise OSError("Tutor event batch was not fully appended")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def read_all(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
@@ -125,6 +154,33 @@ class JsonlLearnerStore:
             for event in self.read_all()
             if event.get("session_id") == session_id
         ]
+
+    def effective_triage_for_cards(
+        self, card_ids: list[int]
+    ) -> dict[int, TriageEvent]:
+        """Resolve latest learner override, otherwise latest Teacher result."""
+        allowed = set(card_ids)
+        latest_teacher: dict[int, TriageEvent] = {}
+        latest_override: dict[int, TriageEvent] = {}
+        for raw_event in self.read_all():
+            if raw_event.get("card_id") not in allowed:
+                continue
+            try:
+                event = TriageEvent.from_mapping(raw_event)
+            except (KeyError, TypeError, ValueError):
+                continue
+            target = (
+                latest_override
+                if event.source == TriageSource.LEARNER_OVERRIDE
+                else latest_teacher
+            )
+            target[event.card_id] = event
+
+        return {
+            card_id: latest_override.get(card_id, latest_teacher.get(card_id))
+            for card_id in card_ids
+            if card_id in latest_override or card_id in latest_teacher
+        }
 
     def has_state_for_card(self, card_id: int, states: set[str]) -> bool:
         return any(

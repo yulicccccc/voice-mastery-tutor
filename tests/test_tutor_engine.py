@@ -93,6 +93,29 @@ class TutorEngineTests(unittest.TestCase):
         self.assertNotEqual(decision.state, LearnerState.MASTERED)
         self.assertIsNone(decision.teaching_method)
 
+    def test_triage_event_does_not_hide_latest_learning_state(self) -> None:
+        self.decide(
+            "A correct explanation",
+            assessment=AnswerAssessment.CORRECT,
+        )
+        self.store.append(
+            {
+                "event_type": "triage_result",
+                "event_id": "triage_test",
+                "session_id": "study_" + "a" * 32,
+                "card_id": 123,
+                "note_id": 456,
+                "treatment": "remember",
+                "source": "teacher",
+                "reason": "worth retaining",
+                "created_at": "2026-08-23T00:00:00+00:00",
+            }
+        )
+
+        self.assertEqual(
+            self.engine.latest_state(123), LearnerState.INDEPENDENT_RECALL
+        )
+
     def test_partial_answer_gets_lightweight_hint_not_mastery(self) -> None:
         decision = self.decide(
             "Part of the answer",

@@ -87,6 +87,76 @@ class ReviewSyncStatus(StringEnum):
     NOT_APPLICABLE = "not_applicable"
 
 
+class TriageTreatment(StringEnum):
+    REFERENCE = "reference"
+    UNDERSTAND = "understand"
+    REMEMBER = "remember"
+    APPLY = "apply"
+    PRACTICE = "practice"
+    IGNORE = "ignore"
+
+
+class TriageSource(StringEnum):
+    TEACHER = "teacher"
+    LEARNER_OVERRIDE = "learner_override"
+
+
+@dataclass(frozen=True)
+class TriageEvent:
+    event_id: str
+    session_id: str
+    card_id: int
+    note_id: int | None
+    treatment: TriageTreatment
+    source: TriageSource
+    reason: str
+    created_at: str
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> TriageEvent:
+        if data.get("event_type") != "triage_result":
+            raise ValueError("not a triage result event")
+        return cls(
+            event_id=str(data["event_id"]),
+            session_id=str(data["session_id"]),
+            card_id=int(data["card_id"]),
+            note_id=(
+                None if data.get("note_id") is None else int(data["note_id"])
+            ),
+            treatment=TriageTreatment(data["treatment"]),
+            source=TriageSource(data["source"]),
+            reason=str(data["reason"]),
+            created_at=str(data["created_at"]),
+        )
+
+    def __post_init__(self) -> None:
+        if not self.event_id.strip():
+            raise ValueError("event_id must not be empty")
+        if not self.session_id.strip():
+            raise ValueError("session_id must not be empty")
+        if self.card_id < 1:
+            raise ValueError("card_id must be a positive integer")
+        if self.note_id is not None and self.note_id < 1:
+            raise ValueError("note_id must be a positive integer")
+        if not self.reason.strip():
+            raise ValueError("reason must not be empty")
+        if not self.created_at.strip():
+            raise ValueError("created_at must not be empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_type": "triage_result",
+            "event_id": self.event_id,
+            "session_id": self.session_id,
+            "card_id": self.card_id,
+            "note_id": self.note_id,
+            "treatment": self.treatment.value,
+            "source": self.source.value,
+            "reason": self.reason,
+            "created_at": self.created_at,
+        }
+
+
 @dataclass(frozen=True)
 class SchedulerSnapshot:
     modified: int
