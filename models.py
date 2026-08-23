@@ -147,6 +147,7 @@ class SchedulerSnapshot:
 @dataclass(frozen=True)
 class ReviewEvent:
     event_id: str
+    session_id: str | None
     card_id: int
     note_id: int | None
     first_attempt_result: FirstAttemptResult
@@ -174,6 +175,7 @@ class ReviewEvent:
     def to_dict(self) -> dict[str, Any]:
         return {
             "event_id": self.event_id,
+            "session_id": self.session_id,
             "card_id": self.card_id,
             "note_id": self.note_id,
             "first_attempt_result": self.first_attempt_result.value,
@@ -193,6 +195,7 @@ class TutorContext:
     card_id: int
     learner_answer: str
     assessment: AnswerAssessment
+    session_id: str | None = None
     note_id: int | None = None
     was_prompted: bool = False
     consecutive_incorrect: int = 0
@@ -206,6 +209,8 @@ class TutorContext:
             raise ValueError("card_id must be a positive integer")
         if not self.learner_answer.strip():
             raise ValueError("learner_answer must not be empty")
+        if self.session_id is not None and not self.session_id.strip():
+            raise ValueError("session_id must not be empty")
         if self.consecutive_incorrect < 0:
             raise ValueError("consecutive_incorrect must not be negative")
 

@@ -6,8 +6,9 @@ import json
 import os
 import sqlite3
 import stat
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from models import (
     AnkiRating,
@@ -116,6 +117,15 @@ class JsonlLearnerStore:
             if event.get("card_id") == card_id
         ]
 
+    def read_session_events(self, session_id: str) -> list[dict[str, Any]]:
+        if not session_id.strip():
+            raise ValueError("session_id must not be empty")
+        return [
+            event
+            for event in self.read_all()
+            if event.get("session_id") == session_id
+        ]
+
     def has_state_for_card(self, card_id: int, states: set[str]) -> bool:
         return any(
             event.get("card_id") == card_id and event.get("state") in states
@@ -127,6 +137,7 @@ class SqliteReviewStore:
     _SCHEMA = """
         create table if not exists review_events (
             event_id text primary key,
+            session_id text,
             card_id integer not null,
             note_id integer,
             first_attempt_result text not null,
@@ -170,13 +181,35 @@ class SqliteReviewStore:
         connection.row_factory = sqlite3.Row
         connection.execute("pragma synchronous = full")
         connection.execute(self._SCHEMA)
+        columns = {
+            str(row[1])
+            for row in connection.execute("pragma table_info(review_events)")
+        }
+        if "session_id" not in columns:
+            connection.execute("alter table review_events add column session_id text")
+        connection.execute(
+            "create index if not exists review_events_session_status "
+            "on review_events(session_id, sync_status)"
+        )
         connection.commit()
         return connection
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> ReviewEvent:
         return ReviewEvent(
             event_id=str(row["event_id"]),
+            session_id=(
+                None if row["session_id"] is None else str(row["session_id"])
+            ),
             card_id=int(row["card_id"]),
             note_id=None if row["note_id"] is None else int(row["note_id"]),
             first_attempt_result=FirstAttemptResult(row["first_attempt_result"]),
@@ -193,18 +226,19 @@ class SqliteReviewStore:
         )
 
     def create_or_get(self, event: ReviewEvent) -> tuple[ReviewEvent, bool]:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             cursor = connection.execute(
                 """
                 insert or ignore into review_events (
-                    event_id, card_id, note_id, first_attempt_result,
+                    event_id, session_id, card_id, note_id, first_attempt_result,
                     mapped_anki_rating, tutor_state, hints_used,
                     scheduler_snapshot, created_at, sync_status,
                     sync_attempts, last_error
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.event_id,
+                    event.session_id,
                     event.card_id,
                     event.note_id,
                     event.first_attempt_result.value,
@@ -223,6 +257,15 @@ class SqliteReviewStore:
                 ),
             )
             created = cursor.rowcount == 1
+            if not created and event.session_id is not None:
+                connection.execute(
+                    """
+                    update review_events
+                    set session_id = ?
+                    where event_id = ? and session_id is null
+                    """,
+                    (event.session_id, event.event_id),
+                )
             row = connection.execute(
                 "select * from review_events where event_id = ?",
                 (event.event_id,),
@@ -236,13 +279,22 @@ class SqliteReviewStore:
                 "this card/scheduler snapshot already has a ReviewEvent with a "
                 "different first-attempt result"
             )
+        if (
+            event.session_id is not None
+            and stored.session_id is not None
+            and stored.session_id != event.session_id
+        ):
+            raise ValueError(
+                "this card/scheduler snapshot already belongs to another study "
+                "session"
+            )
         return stored, created
 
     def get(self, event_id: str) -> ReviewEvent | None:
         if not self.path.exists():
             return None
         self._ensure_safe_file_target()
-        with self._connect() as connection:
+        with self._transaction() as connection:
             row = connection.execute(
                 "select * from review_events where event_id = ?",
                 (event_id,),
@@ -250,20 +302,52 @@ class SqliteReviewStore:
         return None if row is None else self._from_row(row)
 
     def list_by_status(
-        self, status: ReviewSyncStatus, limit: int = 100
+        self,
+        status: ReviewSyncStatus,
+        limit: int = 100,
+        *,
+        session_id: str | None = None,
     ) -> list[ReviewEvent]:
         if not self.path.exists():
             return []
         self._ensure_safe_file_target()
-        with self._connect() as connection:
+        with self._transaction() as connection:
+            if session_id is None:
+                rows = connection.execute(
+                    """
+                    select * from review_events
+                    where sync_status = ?
+                    order by created_at, event_id
+                    limit ?
+                    """,
+                    (status.value, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    select * from review_events
+                    where sync_status = ? and session_id = ?
+                    order by created_at, event_id
+                    limit ?
+                    """,
+                    (status.value, session_id, limit),
+                ).fetchall()
+        return [self._from_row(row) for row in rows]
+
+    def list_for_session(self, session_id: str) -> list[ReviewEvent]:
+        if not self.path.exists():
+            return []
+        if not session_id.strip():
+            raise ValueError("session_id must not be empty")
+        self._ensure_safe_file_target()
+        with self._transaction() as connection:
             rows = connection.execute(
                 """
                 select * from review_events
-                where sync_status = ?
+                where session_id = ?
                 order by created_at, event_id
-                limit ?
                 """,
-                (status.value, limit),
+                (session_id,),
             ).fetchall()
         return [self._from_row(row) for row in rows]
 
@@ -282,7 +366,7 @@ class SqliteReviewStore:
         }:
             raise ValueError(f"unsupported sync transition: {status.value}")
 
-        with self._connect() as connection:
+        with self._transaction() as connection:
             cursor = connection.execute(
                 """
                 update review_events

@@ -121,8 +121,6 @@ RESUME_TARGET_BY_STATE = {
     LearnerState.SKIPPED_LOW_VALUE: "deprioritized_or_skip",
     LearnerState.PAUSED: "resume_when_ready",
 }
-
-
 class TutorEngine:
     def __init__(self, store: JsonlLearnerStore | None = None) -> None:
         self.store = store
@@ -286,11 +284,57 @@ class TutorEngine:
             "recent_relevant_events": recent_events,
         }
 
+    def build_session_progress(
+        self, session_id: str, card_ids: list[int]
+    ) -> dict[str, Any]:
+        """Reconstruct one study batch's progress from durable Tutor events."""
+        if not session_id.strip():
+            raise ValueError("session_id must not be empty")
+        allowed = set(card_ids)
+        events = (
+            self.store.read_session_events(session_id)
+            if self.store is not None
+            else []
+        )
+        latest_states: dict[int, str] = {}
+        completed: set[int] = set()
+        skipped: set[int] = set()
+        for event in events:
+            card_id = event.get("card_id")
+            if card_id not in allowed:
+                continue
+            state = event.get("state")
+            if isinstance(state, str):
+                latest_states[int(card_id)] = state
+            action = event.get("action")
+            if action in {
+                TutorAction.CONFIRM_AND_NEXT.value,
+                TutorAction.SKIP_AND_NEXT.value,
+            }:
+                completed.add(int(card_id))
+            if action == TutorAction.SKIP_AND_NEXT.value:
+                skipped.add(int(card_id))
+
+        completed_in_order = [card_id for card_id in card_ids if card_id in completed]
+        return {
+            "completed_card_ids": completed_in_order,
+            "skipped_card_ids": [card_id for card_id in card_ids if card_id in skipped],
+            "remaining_card_ids": [
+                card_id for card_id in card_ids if card_id not in completed
+            ],
+            "latest_states": {
+                str(card_id): latest_states[card_id]
+                for card_id in card_ids
+                if card_id in latest_states
+            },
+        }
+
     @staticmethod
     def _compact_context_event(event: dict[str, Any]) -> dict[str, Any]:
         return {
             "event_id": event.get("event_id"),
             "created_at": event.get("created_at"),
+            "session_id": event.get("session_id"),
             "card_id": event.get("card_id"),
             "state": event.get("state"),
             "assessment": event.get("assessment"),
@@ -430,6 +474,7 @@ class TutorEngine:
             {
                 "event_id": str(uuid4()),
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "session_id": context.session_id,
                 "card_id": context.card_id,
                 "note_id": context.note_id,
                 "learner_answer": context.learner_answer,

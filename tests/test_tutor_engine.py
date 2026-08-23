@@ -199,6 +199,33 @@ class TutorEngineTests(unittest.TestCase):
             )
         )
 
+    def test_session_progress_recovers_completed_and_remaining_cards(self) -> None:
+        session_id = "study_" + "a" * 32
+        self.engine.decide(
+            TutorContext(
+                card_id=123,
+                session_id=session_id,
+                learner_answer="correct",
+                assessment=AnswerAssessment.CORRECT,
+            )
+        )
+        self.engine.decide(
+            TutorContext(
+                card_id=124,
+                session_id=session_id,
+                learner_answer="I don't want to learn this card",
+                assessment=AnswerAssessment.UNKNOWN,
+            )
+        )
+
+        restarted = TutorEngine(JsonlLearnerStore(self.store.path))
+        progress = restarted.build_session_progress(session_id, [123, 124, 125])
+
+        self.assertEqual(progress["completed_card_ids"], [123, 124])
+        self.assertEqual(progress["skipped_card_ids"], [124])
+        self.assertEqual(progress["remaining_card_ids"], [125])
+        self.assertEqual(progress["latest_states"]["123"], "independent_recall")
+
     def test_stop_has_priority_over_other_teaching_signals(self) -> None:
         decision = self.decide(
             "Please stop the session; I don't understand this card",

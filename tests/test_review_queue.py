@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import stat
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,12 +71,15 @@ class ReviewQueueTests(unittest.TestCase):
         self,
         *,
         first_attempt: FirstAttemptResult,
+        session_id: str | None = None,
+        card_id: int = 123,
         tutor_state: LearnerState = LearnerState.INDEPENDENT_RECALL,
         hints_used: int = 0,
         scheduler_snapshot: SchedulerSnapshot | None = None,
     ):
         event = build_review_event(
-            card_id=123,
+            session_id=session_id,
+            card_id=card_id,
             note_id=456,
             first_attempt_result=first_attempt,
             tutor_state=tutor_state,
@@ -150,6 +154,73 @@ class ReviewQueueTests(unittest.TestCase):
         self.assertEqual(len(recovered), 1)
         self.assertEqual(recovered[0].event_id, event.event_id)
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+
+    def test_process_restart_recovers_session_bound_pending_event(self) -> None:
+        session_id = "study_" + "c" * 32
+        event, _ = self.record(
+            first_attempt=FirstAttemptResult.FAILED,
+            session_id=session_id,
+        )
+
+        restarted = SqliteReviewStore(self.path)
+        recovered = restarted.list_by_status(
+            ReviewSyncStatus.PENDING, session_id=session_id
+        )
+
+        self.assertEqual([item.event_id for item in recovered], [event.event_id])
+        self.assertEqual(recovered[0].session_id, session_id)
+
+    def test_existing_review_database_is_migrated_for_session_ids(self) -> None:
+        old_schema = SqliteReviewStore._SCHEMA.replace(
+            "            session_id text,\n", ""
+        )
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(old_schema)
+
+        migrated = SqliteReviewStore(self.path)
+        migrated.list_by_status(ReviewSyncStatus.PENDING)
+
+        with sqlite3.connect(self.path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute("pragma table_info(review_events)")
+            }
+        self.assertIn("session_id", columns)
+
+    def test_session_filtered_sync_does_not_touch_another_batch(self) -> None:
+        session_a = "study_" + "a" * 32
+        session_b = "study_" + "b" * 32
+        event_a, _ = self.record(
+            first_attempt=FirstAttemptResult.SUCCEEDED,
+            session_id=session_a,
+            card_id=123,
+        )
+        event_b, _ = self.record(
+            first_attempt=FirstAttemptResult.FAILED,
+            session_id=session_b,
+            card_id=124,
+        )
+        adapter = FakeReviewAdapter(snapshot())
+        service = ReviewSyncService(self.store, adapter, writeback_enabled=True)
+
+        result = service.sync_pending(dry_run=False, session_id=session_a)
+
+        self.assertEqual(result["session_id"], session_a)
+        self.assertEqual(result["pending_found"], 1)
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(adapter.apply_calls, 1)
+        self.assertEqual(
+            self.store.get(event_a.event_id).sync_status,
+            ReviewSyncStatus.APPLIED,
+        )
+        self.assertEqual(
+            self.store.get(event_b.event_id).sync_status,
+            ReviewSyncStatus.PENDING,
+        )
+        self.assertEqual(
+            [event.event_id for event in self.store.list_for_session(session_b)],
+            [event_b.event_id],
+        )
 
     def test_anki_unavailable_keeps_event_pending(self) -> None:
         event, _ = self.record(first_attempt=FirstAttemptResult.SUCCEEDED)

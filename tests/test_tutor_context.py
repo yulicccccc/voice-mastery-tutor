@@ -80,6 +80,7 @@ class TutorContextReconstructionTests(unittest.TestCase):
             {
                 "event_id",
                 "created_at",
+                "session_id",
                 "card_id",
                 "state",
                 "assessment",

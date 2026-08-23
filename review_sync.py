@@ -25,6 +25,7 @@ class ReviewAdapter(Protocol):
 
 def build_review_event(
     *,
+    session_id: str | None = None,
     card_id: int,
     note_id: int | None,
     first_attempt_result: FirstAttemptResult,
@@ -46,6 +47,7 @@ def build_review_event(
     )
     return ReviewEvent(
         event_id=ReviewEvent.stable_event_id(card_id, scheduler_snapshot),
+        session_id=session_id,
         card_id=card_id,
         note_id=note_id,
         first_attempt_result=first_attempt_result,
@@ -104,20 +106,29 @@ class ReviewSyncService:
         self._sync_lock = Lock()
 
     def sync_pending(
-        self, *, dry_run: bool = True, limit: int = 100
+        self,
+        *,
+        dry_run: bool = True,
+        limit: int = 100,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
 
         effective_dry_run = dry_run or not self.writeback_enabled
         with self._sync_lock:
-            pending = self.store.list_by_status(ReviewSyncStatus.PENDING, limit)
+            pending = self.store.list_by_status(
+                ReviewSyncStatus.PENDING,
+                limit,
+                session_id=session_id,
+            )
             results = [
                 self._sync_one(event, dry_run=effective_dry_run)
                 for event in pending
             ]
 
         return {
+            "session_id": session_id,
             "dry_run": effective_dry_run,
             "writeback_enabled": self.writeback_enabled,
             "pending_found": len(pending),

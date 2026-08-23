@@ -26,6 +26,7 @@ from review_sync import (
     ReviewSyncService,
     build_review_event,
 )
+from study_session import StudySessionStore, build_voice_handoff
 from tutor_engine import TutorEngine
 
 ANKICONNECT_URL = os.environ.get("ANKICONNECT_URL", "http://127.0.0.1:8765")
@@ -36,6 +37,7 @@ MAX_CARDS_PER_CALL = 100
 ANKI_REVIEW_WRITEBACK_ENABLED = os.environ.get(
     "ANKI_REVIEW_WRITEBACK_ENABLED", "false"
 ).lower() in {"1", "true", "yes"}
+
 
 mcp = FastMCP("voice-mastery-tutor")
 _tutor_engine = TutorEngine(JsonlLearnerStore())
@@ -81,11 +83,22 @@ def _anki_call(action: str, params: dict[str, Any] | None = None) -> Any:
 
 
 _review_store = SqliteReviewStore()
+_study_session_store = StudySessionStore()
 _review_sync_service = ReviewSyncService(
     _review_store,
     AnkiConnectReviewAdapter(_anki_call),
     writeback_enabled=ANKI_REVIEW_WRITEBACK_ENABLED,
 )
+
+
+def _load_session_card(session_id: str, card_id: int) -> dict[str, Any]:
+    session = _study_session_store.load(session_id)
+    if session is None:
+        raise ValueError("study session does not exist")
+    for card in session["cards"]:
+        if card["card_id"] == card_id:
+            return card
+    raise ValueError("card is not part of this study session")
 
 
 def _deck_due_query(deck: str) -> str:
@@ -176,6 +189,66 @@ def get_due_cards(deck: str = DEFAULT_DECK, limit: int = 20) -> dict[str, Any]:
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Read the active durable study session",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def get_study_session(session_id: str | None = None) -> dict[str, Any]:
+    """Load an Anki-created card batch and its durable local progress.
+
+    With no ID, this returns the latest batch created from the Anki dialog. The
+    manifest already contains the selected card content and scheduler snapshots,
+    so a phone can continue the same ChatGPT conversation without selecting cards
+    again. This operation never modifies Anki or local learner state.
+    """
+    session = _study_session_store.load(session_id)
+    if session is None:
+        return {
+            "has_study_session": False,
+            "session_id": session_id,
+            "cards": [],
+        }
+
+    card_ids = [int(card["card_id"]) for card in session["cards"]]
+    progress = _tutor_engine.build_session_progress(
+        str(session["session_id"]), card_ids
+    )
+    reviews = _review_store.list_for_session(str(session["session_id"]))
+    reviewed_card_ids = {event.card_id for event in reviews}
+    durable_completed = reviewed_card_ids | set(progress["skipped_card_ids"])
+    teaching_complete = progress["completed_card_ids"]
+    return {
+        **session,
+        "has_study_session": True,
+        "voice_handoff": build_voice_handoff(session),
+        "progress": {
+            **progress,
+            "teaching_complete_card_ids": teaching_complete,
+            "completed_card_ids": [
+                card_id for card_id in card_ids if card_id in durable_completed
+            ],
+            "remaining_card_ids": [
+                card_id for card_id in card_ids if card_id not in durable_completed
+            ],
+            "complete": all(card_id in durable_completed for card_id in card_ids),
+            "review_events": [
+                {
+                    "event_id": event.event_id,
+                    "card_id": event.card_id,
+                    "mapped_anki_rating": event.mapped_anki_rating.value,
+                    "sync_status": event.sync_status.value,
+                }
+                for event in reviews
+            ],
+        },
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Read compact durable Tutor context for one card",
         readOnlyHint=True,
         destructiveHint=False,
@@ -205,6 +278,7 @@ def decide_tutor_next_step(
     card_id: int,
     learner_answer: str,
     assessment: Literal["correct", "incorrect", "partial", "unknown"],
+    session_id: str | None = None,
     note_id: int | None = None,
     was_prompted: bool = False,
     consecutive_incorrect: int = 0,
@@ -227,8 +301,11 @@ def decide_tutor_next_step(
     `mastered` state also requires previously persisted independent-recall
     evidence; one answer can only become a mastery candidate.
     """
+    if session_id is not None:
+        _load_session_card(session_id, card_id)
     context = TutorContext(
         card_id=card_id,
+        session_id=session_id,
         note_id=note_id,
         learner_answer=learner_answer,
         assessment=AnswerAssessment(assessment),
@@ -241,6 +318,7 @@ def decide_tutor_next_step(
     )
     decision = _tutor_engine.decide(context)
     return {
+        "session_id": session_id,
         "card_id": card_id,
         "note_id": note_id,
         "event_saved_locally": True,
@@ -272,6 +350,7 @@ def record_review_result(
         "paused",
     ],
     scheduler_snapshot: dict[str, Any],
+    session_id: str | None = None,
     note_id: int | None = None,
     hints_used: int = 0,
 ) -> dict[str, Any]:
@@ -284,7 +363,21 @@ def record_review_result(
     idempotent. This tool never calls AnkiConnect or modifies Anki.
     """
     snapshot = SchedulerSnapshot.from_mapping(scheduler_snapshot)
+    if session_id is not None:
+        session_card = _load_session_card(session_id, card_id)
+        expected_snapshot = SchedulerSnapshot.from_mapping(
+            session_card["scheduler_snapshot"]
+        )
+        if snapshot != expected_snapshot:
+            raise ValueError(
+                "scheduler_snapshot does not match the durable study session"
+            )
+        expected_note_id = session_card.get("note_id")
+        if note_id is not None and note_id != expected_note_id:
+            raise ValueError("note_id does not match the durable study session")
+        note_id = expected_note_id
     event = build_review_event(
+        session_id=session_id,
         card_id=card_id,
         note_id=note_id,
         first_attempt_result=FirstAttemptResult(first_attempt_result),
@@ -323,6 +416,7 @@ def record_review_result(
 def sync_pending_reviews(
     dry_run: bool = True,
     limit: int = 100,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Inspect or synchronize durable pending ReviewEvents one card at a time.
 
@@ -333,7 +427,13 @@ def sync_pending_reviews(
     edits Anki DB rows or FSRS fields directly. Only a confirmed `[true]` response
     marks an event applied.
     """
-    return _review_sync_service.sync_pending(dry_run=dry_run, limit=limit)
+    if session_id is not None and _study_session_store.load(session_id) is None:
+        raise ValueError("study session does not exist")
+    return _review_sync_service.sync_pending(
+        dry_run=dry_run,
+        limit=limit,
+        session_id=session_id,
+    )
 
 
 
