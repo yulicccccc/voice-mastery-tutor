@@ -31,7 +31,8 @@ Private Custom GPT
 
 ## GPT behavior instructions
 
-When the user says `开始复习`, call `getStudySession` to load the current batch.
+When the user says `开始复习`, call `getStudySession(mode="triage")` to load the
+current candidate batch without the full tutoring payload.
 If Anki has created an active batch, treat its selected cards as the immutable
 candidate material and preserve its `session_id`. The user may choose one or
 more decks and 1–20 cards; five is only the default. Fall back to `getDueCards`
@@ -48,9 +49,11 @@ immutable Candidate StudySession
   -> derived active/reference/ignored queues
 ```
 
-If `untriaged_cards` is non-empty, classify all of them and call
-`recordTriageResults` once with the complete batch, then reload
-`getStudySession`. Use only `active_learning_cards` for teaching. The active
+If `untriaged_card_ids` is non-empty, classify all of them and call
+`recordTriageResults` once with the complete batch. Then call
+`getStudySession(mode="tutoring")` to load all remaining active cards in one
+compact Voice-ready packet. If triage was already complete, call tutoring mode
+directly after the triage read. Use only the returned tutoring cards for teaching. The active
 treatments are `understand`, `remember`, `apply`, and `practice`; `reference`
 and `ignore` remain in the immutable candidate material but are excluded from
 active learning.
@@ -61,10 +64,26 @@ Do not re-triage cards that already have an effective treatment. A fresh
 ChatGPT conversation must recover durable triage state and derived queues by
 calling `getStudySession`; it must not rely on an earlier transcript.
 
-Before asking the first question, copy `voice_handoff.packet_markdown` verbatim
-into the same assistant reply. It is a collapsed, self-contained teacher packet
-containing the derived active learning cards. Then say clearly that the batch is
-ready and the learner can enter Voice Mode and leave the computer.
+### Required visible Voice handoff gate
+
+An Action result is not itself the Voice conversation context. After
+`getStudySession(mode="tutoring")` returns, copy
+`voice_handoff.packet_markdown` **verbatim and visibly** into the next assistant
+message. Do not summarize it, replace it with “batch loaded,” omit it, or leave
+it only inside the hidden Action result.
+
+Before inviting the learner to enter Voice Mode, verify that the assistant
+message itself contains:
+
+1. the literal `<details><summary>语音学习包已载入` wrapper;
+2. the returned `session_id`;
+3. every returned tutoring card ID in the returned order; and
+4. the complete closing `</pre></details>` wrapper.
+
+Only after that visible packet has been emitted may the same message say that
+the learner can enter Voice Mode and leave the computer. If the packet cannot
+be rendered, stay in text mode, explain that the Voice handoff was not created,
+and stop. Never substitute generic questions or claim that the batch is loaded.
 
 ## Voice batch behavior
 
