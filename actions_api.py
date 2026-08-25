@@ -181,8 +181,8 @@ def _openapi_schema(base_url: str) -> dict[str, Any]:
                 (
                     "Load the immutable candidate batch and durable triage state. "
                     "Use mode=triage for compact classification content. After "
-                    "triage is persisted, use mode=full for active learning and "
-                    "voice_handoff. Never changes Anki."
+                    "triage is persisted, use mode=tutoring to preload the compact "
+                    "active tutoring batch before Voice Mode. Never changes Anki."
                 ),
                 {
                     "session_id": {
@@ -191,8 +191,12 @@ def _openapi_schema(base_url: str) -> dict[str, Any]:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["full", "triage"],
+                        "enum": ["full", "triage", "tutoring"],
                         "default": "full",
+                    },
+                    "card_id": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
                     },
                 },
                 [],

@@ -259,9 +259,13 @@ class ActionsApiTests(unittest.TestCase):
             "requestBody"
         ]["content"]["application/json"]["schema"]["properties"]
         self.assertEqual(
-            study_session_properties["mode"]["enum"], ["full", "triage"]
+            study_session_properties["mode"]["enum"],
+            ["full", "triage", "tutoring"],
         )
         self.assertEqual(study_session_properties["mode"]["default"], "full")
+        self.assertEqual(
+            study_session_properties["card_id"]["type"], ["integer", "null"]
+        )
 
 
 if __name__ == "__main__":

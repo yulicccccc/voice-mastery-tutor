@@ -6,6 +6,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from html import escape
 from html.parser import HTMLParser
 from typing import Any, Literal, TypedDict
 from urllib.error import HTTPError, URLError
@@ -33,7 +34,11 @@ from review_sync import (
     ReviewSyncService,
     build_review_event,
 )
-from study_session import StudySessionStore, build_voice_handoff
+from study_session import (
+    StudySessionStore,
+    VOICE_HANDOFF_PROTOCOL,
+    build_voice_handoff,
+)
 from tutor_engine import TutorEngine
 
 ANKICONNECT_URL = os.environ.get("ANKICONNECT_URL", "http://127.0.0.1:8765")
@@ -269,6 +274,120 @@ def _compact_triage_fields(fields: Any) -> dict[str, str]:
     return result
 
 
+def _compact_tutoring_response(
+    session: dict[str, Any],
+    triage: dict[str, Any],
+    requested_card_id: int | None = None,
+) -> dict[str, Any]:
+    session_id = str(session["session_id"])
+    active_cards = triage["active_learning_cards"]
+    active_card_ids = [int(card["card_id"]) for card in active_cards]
+    progress = _tutor_engine.build_session_progress(session_id, active_card_ids)
+    reviews = _review_store.list_for_session(session_id)
+    active_set = set(active_card_ids)
+    reviewed_card_ids = {
+        event.card_id for event in reviews if event.card_id in active_set
+    }
+    durable_completed = reviewed_card_ids | set(progress["skipped_card_ids"])
+    remaining_card_ids = [
+        cid for cid in active_card_ids if cid not in durable_completed
+    ]
+    effective = triage["effective_results"]
+
+    selected_cards = []
+    if requested_card_id is not None:
+        for pos, card in enumerate(active_cards, start=1):
+            if int(card["card_id"]) == requested_card_id:
+                selected_cards.append((pos, card))
+                break
+        if not selected_cards:
+            raise ValueError("requested card_id is not in the active learning queue")
+    else:
+        for pos, card in enumerate(active_cards, start=1):
+            if int(card["card_id"]) in remaining_card_ids:
+                selected_cards.append((pos, card))
+
+    cards = []
+    for pos, card in selected_cards:
+        cid = int(card["card_id"])
+        event = effective.get(str(cid))
+        treatment = event["treatment"] if event else "remember"
+        triage_reason = event.get("reason", "") if event else ""
+        cards.append(
+            {
+                "position": pos,
+                "total_active": len(active_cards),
+                "card_id": cid,
+                "note_id": int(card["note_id"]),
+                "deck": str(card.get("deck", "")),
+                "model": str(card.get("model", "")),
+                "treatment": treatment,
+                "triage_reason": _plain_triage_text(triage_reason)[:400],
+                "content_fields": _compact_triage_fields(card.get("fields")),
+                "scheduler_snapshot": card.get("scheduler_snapshot"),
+            }
+        )
+
+    voice_cards = [
+        {
+            "position": c["position"],
+            "card_id": c["card_id"],
+            "note_id": c["note_id"],
+            "deck": c["deck"],
+            "model": c["model"],
+            "treatment": c["treatment"],
+            "teacher_fields": c["content_fields"],
+        }
+        for c in cards
+    ]
+    voice_payload = {
+        "protocol": VOICE_HANDOFF_PROTOCOL,
+        "session_id": session_id,
+        "card_count": len(voice_cards),
+        "rules": [
+            "Use only these cards, in order, for this voice study batch.",
+            "Do not call any Action while the learner is in Voice Mode.",
+            "Remember the first unaided result, hints used, and final Tutor state for each card.",
+            "Continue automatically until the batch ends or the learner says stop or pause.",
+            "After Voice Mode ends, wait for the text command 保存本次学习 before persisting results.",
+        ],
+        "cards": voice_cards,
+    }
+    serialized = json.dumps(voice_payload, ensure_ascii=False, separators=(",", ":"))
+    packet_markdown = (
+        "<details><summary>语音学习包已载入（学习时无需展开）</summary>"
+        f"<pre>{escape(serialized)}</pre></details>"
+    )
+    voice_handoff = {
+        "protocol": VOICE_HANDOFF_PROTOCOL,
+        "card_count": len(voice_cards),
+        "packet_markdown": packet_markdown,
+        "required_pre_voice_behavior": (
+            "Place packet_markdown verbatim in the same assistant reply before "
+            "asking the first question. After that reply, the learner may enter "
+            "Voice Mode and leave the computer; use only the embedded batch and "
+            "do not call Actions between cards."
+        ),
+        "post_voice_save_command": "保存本次学习",
+    }
+
+    return {
+        "has_study_session": True,
+        "mode": "tutoring",
+        "session_id": session_id,
+        "triage_complete": triage["triage_complete"],
+        "active_card_ids": active_card_ids,
+        "completed_card_ids": [
+            cid for cid in active_card_ids if cid in durable_completed
+        ],
+        "remaining_card_ids": remaining_card_ids,
+        "is_complete": triage["triage_complete"] and len(remaining_card_ids) == 0,
+        "card_count": len(cards),
+        "cards": cards,
+        "voice_handoff": voice_handoff,
+    }
+
+
 def _compact_triage_response(
     session: dict[str, Any], triage: dict[str, Any]
 ) -> dict[str, Any]:
@@ -368,18 +487,20 @@ def get_due_cards(deck: str = DEFAULT_DECK, limit: int = 20) -> dict[str, Any]:
 )
 def get_study_session(
     session_id: str | None = None,
-    mode: Literal["full", "triage"] = "full",
+    mode: Literal["full", "triage", "tutoring"] = "full",
+    card_id: int | None = None,
 ) -> dict[str, Any]:
     """Load an Anki-created card batch and its durable local progress.
 
     With no ID, this returns the latest immutable candidate batch plus durable
     triage-derived queues. Untriaged cards must be classified before teaching;
     only the active learning cards are included in the Voice handoff. Use triage
-    mode to read bounded semantic snippets without the full Voice payload. This
-    operation never modifies Anki or local learner state.
+    mode to read bounded semantic snippets for classification. Use tutoring mode
+    to load only the current card to teach in the active queue without oversized
+    payloads. This operation never modifies Anki or local learner state.
     """
-    if mode not in {"full", "triage"}:
-        raise ValueError("mode must be full or triage")
+    if mode not in {"full", "triage", "tutoring"}:
+        raise ValueError("mode must be full, triage, or tutoring")
     session = _study_session_store.load(session_id)
     if session is None:
         missing = {
@@ -387,14 +508,21 @@ def get_study_session(
             "session_id": session_id,
             "cards": [],
         }
-        if mode == "triage":
-            missing["mode"] = "triage"
+        if mode in {"triage", "tutoring"}:
+            missing["mode"] = mode
         return missing
 
     triage = _tutor_engine.build_triage_view(session["cards"])
     completion = _study_session_store.load_completion(str(session["session_id"]))
     if mode == "triage":
         return {**_compact_triage_response(session, triage), "completion": completion}
+    if mode == "tutoring":
+        return {
+            **_compact_tutoring_response(
+                session, triage, requested_card_id=card_id
+            ),
+            "completion": completion,
+        }
 
     active_cards = triage["active_learning_cards"]
     card_ids = [int(card["card_id"]) for card in active_cards]

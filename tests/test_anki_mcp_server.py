@@ -227,7 +227,7 @@ class StudySessionToolTests(unittest.TestCase):
         self.assertFalse(annotations.openWorldHint)
         self.assertEqual(
             tools["get_study_session"].inputSchema["properties"]["mode"]["enum"],
-            ["full", "triage"],
+            ["full", "triage", "tutoring"],
         )
 
     def test_active_session_and_progress_are_recovered_without_anki(self) -> None:
@@ -406,6 +406,192 @@ class TeacherTriageToolTests(unittest.TestCase):
             self.assertNotIn("Glossary", compact["cards"][0]["content_fields"])
             self.assertEqual(session_store.load(session_id), before_manifest)
             self.assertEqual(review_store.list_for_session(session_id), [])
+
+    def test_compact_tutoring_mode_preloads_all_active_cards_under_oversized_payload(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            session_id = "study_" + "d" * 32
+            card_ids = (301, 302, 303, 304, 305)
+            session_store = write_session(
+                directory, session_id=session_id, card_ids=card_ids
+            )
+            manifest_path = session_store.sessions_directory / f"{session_id}.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            semantic_fields = (
+                {"Word": "ephemeral", "Definition": "lasting for a very short time"},
+                {"Word": "tenacious", "Definition": "tending to keep a firm hold"},
+                {"Word": "lucid", "Definition": "expressed clearly; easy to understand"},
+                {"Word": "pragmatic", "Definition": "dealing with things sensibly"},
+                {"Word": "resilient", "Definition": "able to withstand or recover quickly"},
+            )
+            giant_dictionary = (
+                "<div><b>dictionary detail</b> " + "huge entry " * 10_000 + "</div>"
+            )
+            for card, semantic in zip(manifest["cards"], semantic_fields):
+                card["fields"] = {
+                    **semantic,
+                    "Style": "<style>body { font-size: 14px; }</style>" + "z" * 20_000,
+                    "Audio": "[sound:pronunciation.mp3]",
+                    "URL": "https://example.invalid/entry",
+                    "DictionaryHTML": giant_dictionary,
+                }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            before_manifest = session_store.load(session_id)
+            engine = TutorEngine(
+                JsonlLearnerStore(Path(directory) / "tutor.jsonl")
+            )
+            review_store = SqliteReviewStore(Path(directory) / "reviews.sqlite3")
+
+            with (
+                patch.object(server, "_study_session_store", session_store),
+                patch.object(server, "_tutor_engine", engine),
+                patch.object(server, "_review_store", review_store),
+                patch.object(server, "_anki_call") as anki_call,
+            ):
+                # 1. Record triage: all 5 cards are triaged as active learning
+                server.record_triage_results(
+                    session_id=session_id,
+                    results=[
+                        {
+                            "card_id": cid,
+                            "treatment": "remember",
+                            "source": "teacher",
+                            "reason": "core vocabulary",
+                        }
+                        for cid in card_ids
+                    ],
+                )
+
+                # 2. Preload compact tutoring batch before entering Voice Mode
+                tutoring = server.get_study_session(session_id, mode="tutoring")
+
+            tutoring_json = json.dumps(tutoring, ensure_ascii=False)
+            tutoring_bytes = len(tutoring_json.encode("utf-8"))
+
+            anki_call.assert_not_called()
+            self.assertEqual(session_store.load(session_id), before_manifest)
+            self.assertEqual(review_store.list_for_session(session_id), [])
+
+            # Verify compact payload size (< 15 KB vs > 100 KB for raw full)
+            self.assertLess(tutoring_bytes, 15_000)
+
+            # Verify queue metadata
+            self.assertTrue(tutoring["has_study_session"])
+            self.assertEqual(tutoring["mode"], "tutoring")
+            self.assertTrue(tutoring["triage_complete"])
+            self.assertEqual(tutoring["active_card_ids"], list(card_ids))
+            self.assertEqual(tutoring["completed_card_ids"], [])
+            self.assertEqual(tutoring["remaining_card_ids"], list(card_ids))
+            self.assertFalse(tutoring["is_complete"])
+
+            # Verify all 5 cards are present in original active order with compact fields
+            self.assertEqual(tutoring["card_count"], 5)
+            self.assertEqual(
+                [c["card_id"] for c in tutoring["cards"]], list(card_ids)
+            )
+            for pos, (card_dict, expected_id, expected_semantic) in enumerate(
+                zip(tutoring["cards"], card_ids, semantic_fields), start=1
+            ):
+                self.assertEqual(card_dict["position"], pos)
+                self.assertEqual(card_dict["card_id"], expected_id)
+                self.assertEqual(card_dict["treatment"], "remember")
+                self.assertEqual(
+                    card_dict["content_fields"]["Word"],
+                    expected_semantic["Word"],
+                )
+                self.assertIsNotNone(card_dict["scheduler_snapshot"])
+
+            # Verify raw noise is filtered out
+            self.assertNotIn("body { font-size: 14px; }", tutoring_json)
+            self.assertNotIn("[sound:", tutoring_json)
+
+            # Verify voice_handoff packet contains all 5 cards in compact form
+            self.assertEqual(tutoring["voice_handoff"]["card_count"], 5)
+            self.assertIn("语音学习包已载入", tutoring["voice_handoff"]["packet_markdown"])
+
+            # 3. Test specific card_id lookup (single compact card)
+            with (
+                patch.object(server, "_study_session_store", session_store),
+                patch.object(server, "_tutor_engine", engine),
+                patch.object(server, "_review_store", review_store),
+                patch.object(server, "_anki_call") as anki_call,
+            ):
+                tutoring_single = server.get_study_session(
+                    session_id, mode="tutoring", card_id=304
+                )
+
+            self.assertEqual(tutoring_single["card_count"], 1)
+            self.assertEqual(tutoring_single["cards"][0]["card_id"], 304)
+            self.assertEqual(tutoring_single["cards"][0]["position"], 4)
+            self.assertEqual(
+                tutoring_single["cards"][0]["content_fields"]["Word"], "pragmatic"
+            )
+
+    def test_compact_tutoring_mode_twenty_oversized_cards_payload_stays_bounded(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            session_id = "study_" + "e" * 32
+            card_ids = tuple(range(501, 521))  # 20 cards
+            session_store = write_session(
+                directory, session_id=session_id, card_ids=card_ids
+            )
+            manifest_path = session_store.sessions_directory / f"{session_id}.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            giant_dictionary = (
+                "<div><b>dictionary entry</b> " + "sample sentence " * 5_000 + "</div>"
+            )
+            for index, card in enumerate(manifest["cards"], start=1):
+                card["fields"] = {
+                    "Word": f"vocab_{index}",
+                    "Definition": f"Meaning of vocabulary term {index}",
+                    "Example": f"Example sentence demonstrating term {index}",
+                    "Style": "<style>div.entry { color: blue; }</style>" + "w" * 10_000,
+                    "Audio": f"[sound:vocab_{index}.mp3]",
+                    "DictionaryHTML": giant_dictionary,
+                }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            engine = TutorEngine(
+                JsonlLearnerStore(Path(directory) / "tutor.jsonl")
+            )
+            review_store = SqliteReviewStore(Path(directory) / "reviews.sqlite3")
+
+            with (
+                patch.object(server, "_study_session_store", session_store),
+                patch.object(server, "_tutor_engine", engine),
+                patch.object(server, "_review_store", review_store),
+                patch.object(server, "_anki_call") as anki_call,
+            ):
+                server.record_triage_results(
+                    session_id=session_id,
+                    results=[
+                        {
+                            "card_id": cid,
+                            "treatment": "remember" if cid % 2 == 0 else "apply",
+                            "source": "teacher",
+                            "reason": f"target term {cid}",
+                        }
+                        for cid in card_ids
+                    ],
+                )
+
+                tutoring_20 = server.get_study_session(session_id, mode="tutoring")
+
+            tutoring_json_20 = json.dumps(tutoring_20, ensure_ascii=False)
+            tutoring_bytes_20 = len(tutoring_json_20.encode("utf-8"))
+
+            anki_call.assert_not_called()
+            self.assertEqual(tutoring_20["card_count"], 20)
+            self.assertEqual(
+                [c["card_id"] for c in tutoring_20["cards"]], list(card_ids)
+            )
+            # 20 oversized cards stay safely bounded below 45 KB (Action limit is ~100 KB)
+            self.assertLess(tutoring_bytes_20, 45_000)
+            self.assertNotIn("div.entry { color: blue; }", tutoring_json_20)
+            self.assertNotIn("[sound:", tutoring_json_20)
 
     def test_batch_triage_derives_queues_without_touching_manifest_anki_or_reviews(
         self,
