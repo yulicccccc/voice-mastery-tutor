@@ -148,6 +148,23 @@ def _load_session_card(session_id: str, card_id: int) -> dict[str, Any]:
     raise ValueError("card is not part of this study session")
 
 
+def reconcile_session_completion(session_id: str) -> dict[str, Any]:
+    """Rebuild lifecycle from durable evidence without contacting Anki."""
+    session = _study_session_store.load(session_id)
+    if session is None:
+        raise ValueError("study session does not exist")
+    triage = _tutor_engine.build_triage_view(session["cards"])
+    active_card_ids = [
+        int(card["card_id"]) for card in triage["active_learning_cards"]
+    ]
+    return _study_session_store.refresh_completion(
+        session_id,
+        triage_complete=bool(triage["triage_complete"]),
+        active_card_ids=active_card_ids,
+        review_events=_review_store.list_for_session(session_id),
+    )
+
+
 def _deck_due_query(deck: str) -> str:
     # Anki search syntax uses backslash escaping inside a quoted deck name.
     escaped = deck.replace("\\", "\\\\").replace('"', '\\"')
@@ -375,8 +392,9 @@ def get_study_session(
         return missing
 
     triage = _tutor_engine.build_triage_view(session["cards"])
+    completion = _study_session_store.load_completion(str(session["session_id"]))
     if mode == "triage":
-        return _compact_triage_response(session, triage)
+        return {**_compact_triage_response(session, triage), "completion": completion}
 
     active_cards = triage["active_learning_cards"]
     card_ids = [int(card["card_id"]) for card in active_cards]
@@ -400,6 +418,7 @@ def get_study_session(
         "active_learning_cards": active_cards,
         "reference_cards": triage["reference_cards"],
         "ignored_cards": triage["ignored_cards"],
+        "completion": completion,
         "voice_handoff": build_voice_handoff(active_session),
         "progress": {
             **progress,
@@ -491,10 +510,12 @@ def record_triage_results(
         )
 
     _tutor_engine.record_triage_events(events)
+    completion = reconcile_session_completion(session_id)
     return {
         "session_id": session_id,
         "recorded_count": len(events),
         "results": [event.to_dict() for event in events],
+        "completion": completion,
         "candidate_manifest_mutated": False,
         "review_events_created": 0,
         "anki_mutated": False,
@@ -640,20 +661,32 @@ def record_review_result(
         scheduler_snapshot=snapshot,
     )
     if event is None:
+        completion = (
+            reconcile_session_completion(session_id)
+            if session_id is not None
+            else None
+        )
         return {
             "recorded": False,
             "duplicate": False,
             "event_id": None,
             "sync_status": ReviewSyncStatus.NOT_APPLICABLE.value,
             "reason": "no genuine first unaided retrieval attempt",
+            "completion": completion,
             "anki_mutated": False,
         }
 
     stored, created = _review_store.create_or_get(event)
+    completion = (
+        reconcile_session_completion(session_id)
+        if session_id is not None
+        else None
+    )
     return {
         "recorded": True,
         "duplicate": not created,
         "anki_mutated": False,
+        "completion": completion,
         **stored.to_dict(),
     }
 
@@ -683,11 +716,23 @@ def sync_pending_reviews(
     """
     if session_id is not None and _study_session_store.load(session_id) is None:
         raise ValueError("study session does not exist")
-    return _review_sync_service.sync_pending(
+    result = _review_sync_service.sync_pending(
         dry_run=dry_run,
         limit=limit,
         session_id=session_id,
     )
+    completions: dict[str, dict[str, Any]] = {}
+    if not result["dry_run"]:
+        affected_session_ids = {session_id} if session_id is not None else set()
+        for item in result["results"]:
+            event = _review_store.get(item["event_id"])
+            if event is not None and event.session_id is not None:
+                affected_session_ids.add(event.session_id)
+        for affected_session_id in sorted(affected_session_ids):
+            completions[affected_session_id] = reconcile_session_completion(
+                affected_session_id
+            )
+    return {**result, "session_completions": completions}
 
 
 
